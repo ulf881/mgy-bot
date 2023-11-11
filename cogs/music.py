@@ -187,18 +187,8 @@ class Music(commands.Cog):
                 self.queue[guild_id].clear()
                 self.guild_voice_client.pop(guild_id)
             else:
-                flag = False
-                # Verifica se o bot está no canal de voz. Se não está limpamos a lista
-                for id in list(members):  # pylint: disable=redefined-builtin
-                    if id == 596088044877119507:  # ID do bot
-                        flag = True
-                        break
-                if not flag:
-                    self.queue[guild_id].clear()
-                    self.guild_voice_client.pop(guild_id)
-                else:
-                    log.info("%s : possui %s online", str(guild_id), str(len(members)))
-        log.info("Finalizado verificacao")
+                log.info("%s : possui %s online", str(guild_id), str(len(members)))
+
         # Se não esta tocando em nenhuma guild, encerra a tarefa
         if not self.guild_voice_client or len(self.guild_voice_client) == 0:
             log.info("Tarefa encerrada")
