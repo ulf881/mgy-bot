@@ -1,0 +1,6 @@
+cogs/__pycache__
+utils/__pycache__
+discordBot.log
+deploy&dumps
+*.exe
+test.py
