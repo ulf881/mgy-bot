@@ -67,9 +67,9 @@ class Eventos(commands.Cog, name="Eventos"):
         )
 
         # Pega canal default
-        if message.guild.id == 470710752789921803:
+        if message.guild.id == 1192899104330743998:
             default_channel = self.bot.get_channel(
-                470740628213465114
+                1192899105781993535
             )  # Staff random shit
         else:
             default_channel = self.bot.get_channel(message.channel.id)

@@ -76,7 +76,7 @@ def switch(guild_id: int):
     """Switch case para pegar macro"""
     print(guild_id)
     return {
-        470710752789921803: os.environ["MACRO"],
+        1192899104330743998: os.environ["MACRO"],
         582709300506656792: os.environ["MACRO2"],
     }.get(guild_id, "MGY")
 
