@@ -150,8 +150,16 @@ class Mod(commands.Cog, name="Mod"):
                 links += ", [" + field[0] + "]" + "(" + field[1] + ")"
 
         embed = discord.Embed(colour=mention.color)
+
+        # Ajustar url do avatar (Tratativa pra caso user não possua avatar)
+        mention_url = ""
+        if mention.avatar and mention.avatar.url:
+            mention_url = mention.avatar.url
+
         embed.set_author(
-            name=mention.name, url=mention.avatar.url, icon_url=mention.avatar.url
+            name=mention.name,
+            url=mention_url,
+            icon_url=mention_url,
         )
 
         embed.add_field(name="Mensagens eviadas", value="Calculando...")
@@ -172,7 +180,7 @@ class Mod(commands.Cog, name="Mod"):
         if mention.id == 229043445010923520:
             embed.add_field(name="Gay", value="Sim")
         # bittenca
-        if mention.id == 161271087496298507:
+        if mention.id == 1192914110459936829:
             embed.add_field(name="Viadin", value="Sim")
         # lider
         if mention.id == 159598240726122496:

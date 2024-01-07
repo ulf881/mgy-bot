@@ -295,6 +295,12 @@ class Level(commands.Cog, name="Level"):
         # Consulta para buscar informacoes do usuario que enviou a mensagem
         resultado = await self.find_user(ctx.author.id, ctx.guild.id)
         log.info("Buscando exp do usuario")
+
+        # Tratativa caso não possua avatar
+        url = ""
+        if ctx.author.avatar and ctx.author.avatar.url:
+            url = ctx.author.avatar.url
+
         # Usuario encontrado
         if resultado:
             experiencia_atual = int(resultado[0]["experiencia"])
@@ -304,7 +310,7 @@ class Level(commands.Cog, name="Level"):
             embed.set_author(
                 name=ctx.author.name,
                 url="https://www.youtube.com/watch?v=Tu5-h4Ye0J0",
-                icon_url=ctx.author.avatar.url,
+                icon_url=url,
             )
             # embed.set_image(url='https://cdn.discordapp.com/attachments/84319995256905728/252292324967710721/embed.png')
 
