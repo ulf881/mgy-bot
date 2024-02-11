@@ -1,6 +1,7 @@
 """
     Modulo cuidar dos eventos on_SOMETHING
 """
+
 import io
 import logging
 from random import randint
@@ -10,6 +11,7 @@ import discord
 
 from discord.ext import commands
 from cogs.level import Level
+from utils.pgdatabase import Postgres
 
 log = logging.getLogger("Eventos")
 
@@ -23,6 +25,7 @@ class Eventos(commands.Cog, name="Eventos"):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.pg = Postgres()
         self.counter_lembra = 0
         self.counter_frota = 0
         self.voice_id = 0
@@ -91,7 +94,7 @@ class Eventos(commands.Cog, name="Eventos"):
 
         # Detectada mensagem do Max
         if message.author.id == 229043445010923520:
-            await message.add_reaction("<:mgy:651473587022331928>")
+            await message.add_reaction("<:okgay:1193368846321586250>")
             self.counter_lembra += 1
             self.counter_frota += 1
 
