@@ -465,9 +465,13 @@ class Music(commands.Cog):
     async def fast_forward(self, ctx: commands.Context, seconds: int):
         """Avança o áudio atual por um número específico de segundos"""
         if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
-            self.queue[ctx.guild.id].insert(1, self.queue[ctx.guild.id][0])
-            ctx.voice_client.stop()
-            await self.tocar(ctx, "-ss {seconds}")
+            ctx.voice_client._player = await YTDLSource.from_url(
+                self.queue[ctx.guild.id],
+                self.queue[ctx.guild.id][0],
+                "-ss {seconds}",
+                loop=self.bot.loop,
+                stream=True,
+            )
 
     @commands.command(aliases=["gvol", "gv", "gvolmax", "gmaxvol", "alwaysvolmax"])
     async def globalvolume(self, ctx: commands.Context, *args):
