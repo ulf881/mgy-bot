@@ -461,7 +461,10 @@ class Music(commands.Cog):
 
     @commands.command(aliases=["ff", "fastforward"])
     async def fast_forward(self, ctx: commands.Context, seconds: int):
-        """Avança o áudio atual por um número específico de segundos do video. Sempre é considerado a partir do inicio e não o momento atual"""
+        """Avança o áudio atual por um número específico de segundos do video. Sempre é considerado a partir do inicio e não o momento atual
+
+        Exemplo: mgy ff 60 - Vai tocar a partir do segundo 60 do video atual
+        """
         if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
             ctx.voice_client._player.source = await YTDLSource.from_url(
                 self.queue[ctx.guild.id],
