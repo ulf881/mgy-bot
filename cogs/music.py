@@ -468,7 +468,7 @@ class Music(commands.Cog):
             ctx.voice_client._player = await YTDLSource.from_url(
                 self.queue[ctx.guild.id],
                 self.queue[ctx.guild.id][0],
-                "-ss {seconds}",
+                f"-ss {seconds}",
                 loop=self.bot.loop,
                 stream=True,
             )
