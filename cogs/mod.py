@@ -1,6 +1,7 @@
 """
     Modulo para games. AKA CrappyDungeon
 """
+
 import logging
 import os
 import sys
@@ -58,7 +59,16 @@ class Mod(commands.Cog, name="Mod"):
         """Reset all"""
         await ctx.send("```Updating & restarting, aguarde uns 10-20s...```")
         subprocess.check_call(
-            ["sudo", "python3", "-m", "pip", "install", "--upgrade", "yt_dlp"]
+            [
+                "sudo",
+                "python3",
+                "-m",
+                "pip",
+                "install",
+                "--U",
+                "--pre",
+                "yt-dlp[default]",
+            ]
         )
         os.execl(sys.executable, sys.executable, *sys.argv)
 
