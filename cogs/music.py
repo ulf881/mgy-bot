@@ -465,6 +465,7 @@ class Music(commands.Cog):
     async def fast_forward(self, ctx: commands.Context, seconds: int):
         """Avança o áudio atual por um número específico de segundos"""
         if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
+            await ctx.voice_client.stop()
             await self.tocar(ctx, "-ss {seconds}")
 
     @commands.command(aliases=["gvol", "gv", "gvolmax", "gmaxvol", "alwaysvolmax"])
