@@ -461,7 +461,7 @@ class Music(commands.Cog):
                 ctx.voice_client.source.volume = volume / 100
                 await ctx.send("Volume trocado para {}%".format(volume))
 
-    @commands.command(aliases=["ff", "fastforward"])
+    @commands.command(aliases=["ff", "fastforward"], hidden=True)
     async def fast_forward(self, ctx: commands.Context, seconds: int):
         """Avança o áudio atual por um número específico de segundos"""
         if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
