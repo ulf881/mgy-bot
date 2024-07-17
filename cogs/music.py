@@ -100,7 +100,6 @@ class YTDLSource(discord.PCMVolumeTransformer):
         cls,
         queue: dict,
         url: str,
-        *,
         extraArgs: str,
         loop=None,
         stream=False,
