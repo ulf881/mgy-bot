@@ -138,8 +138,8 @@ class YTDLSource(discord.PCMVolumeTransformer):
             )
             raise
         if PERFORMANCE_MODE:
+            currentOptions = ffmpeg_options
             if extraArgs:
-                currentOptions = ffmpeg_options
                 currentOptions["before_options"] = (
                     f"{currentOptions.get('before_options', '')} {extraArgs}"
                 )
@@ -1027,9 +1027,9 @@ class Music(commands.Cog):
         if ctx.voice_client is None:
             if ctx.author.voice:
                 # guarda o voice client para utilizar no verify alone
-                self.guild_voice_client[
-                    ctx.guild.id
-                ] = await ctx.author.voice.channel.connect()
+                self.guild_voice_client[ctx.guild.id] = (
+                    await ctx.author.voice.channel.connect()
+                )
 
                 try:
                     if not self.verifyalone.is_running():  # pylint: disable=no-member
