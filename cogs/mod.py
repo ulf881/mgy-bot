@@ -65,7 +65,7 @@ class Mod(commands.Cog, name="Mod"):
                 "-m",
                 "pip",
                 "install",
-                "--U",
+                "-U",
                 "--pre",
                 "yt-dlp[default]",
             ]

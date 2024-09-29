@@ -136,7 +136,9 @@ class YTDLSource(discord.PCMVolumeTransformer):
             log.error(
                 "Erro ao adquirir video, tentando encontrar nova na lista. Erro: %s", e
             )
-            raise
+            if(queue[0]):
+                queue.pop(0)
+            return None
         currentOptions = ffmpeg_options.copy()
         if extraArgs:
             currentOptions["before_options"] = (
@@ -276,7 +278,7 @@ class Music(commands.Cog):
             except Exception as e:  # pylint: disable=broad-exception-caught
                 # if erro 403
                 log.error("Erro ao spotify playlist: %s %s", str(tries), e)
-                await asyncio.sleep(2)  # delay para evitar too many requests
+                await asyncio.sleep(5)  # delay para evitar too many requests
                 if tries >= 2:
                     raise e
 
@@ -344,13 +346,15 @@ class Music(commands.Cog):
         if self.queue[ctx.guild.id]:
             async with ctx.typing():
                 try:
-                    player = await YTDLSource.from_url(
-                        self.queue[ctx.guild.id],
-                        self.queue[ctx.guild.id][0],
-                        extraArgs,
-                        loop=self.bot.loop,
-                        stream=True,
-                    )
+                    player = None
+                    while player is None and self.queue[ctx.guild.id][0]:
+                        player = await YTDLSource.from_url(
+                            self.queue[ctx.guild.id],
+                            self.queue[ctx.guild.id][0],
+                            extraArgs,
+                            loop=self.bot.loop,
+                            stream=True,
+                        )
                 except Exception as e:  # pylint: disable=broad-exception-caught
                     log.error("Erro ao iniciar o player %s", e, exc_info=1)
                     player = None
