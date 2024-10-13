@@ -427,7 +427,7 @@ class Music(commands.Cog):
                     except Exception as e:  # pylint: disable=broad-exception-caught
                         log.error("Deu ruim ao tocar! %s", e, exc_info=1)
 
-    @commands.command(aliases=["vol", "v", "volmax", "maxvol"])
+    @commands.command(aliases=["vol", "v", "volmax", "maxvol", "volmilas"])
     async def volume(self, ctx: commands.Context, *args):
         """Troca o volume.
 
@@ -459,6 +459,9 @@ class Music(commands.Cog):
             elif "-r" in args or "reset" in args or "-reset" in args:
                 ctx.voice_client.source.volume = 50 / 100
                 await ctx.send("Volume resetado")
+            elif ctx.invoked_with.lower() == "volmilas":
+                ctx.voice_client.source.volume += 4.20
+                await ctx.send(f"Volmilas subiu volume em 4.20%. Atual {ctx.voice_client.source.volume}")
             else:
                 ctx.voice_client.source.volume = volume / 100
                 await ctx.send("Volume trocado para {}%".format(volume))
