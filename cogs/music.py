@@ -1,6 +1,7 @@
 """
     Modulo para comandos de musica
 """
+
 from __future__ import annotations
 import os
 import asyncio
@@ -95,7 +96,14 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.url: str = data.get("url")
 
     @classmethod
-    async def from_url(cls, queue: dict, url: str, *, loop=None, stream=False):
+    async def from_url(
+        cls,
+        queue: dict,
+        url: str,
+        extraArgs: str,
+        loop=None,
+        stream=False,
+    ):
         """Retira informações da url"""
         loop = loop or asyncio.get_event_loop()
         try:
@@ -128,13 +136,18 @@ class YTDLSource(discord.PCMVolumeTransformer):
             log.error(
                 "Erro ao adquirir video, tentando encontrar nova na lista. Erro: %s", e
             )
-            raise
-        if PERFORMANCE_MODE:
-            return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
-        else:
-            return cls(
-                discord.FFmpegPCMAudio(filename, **ffmpeg_options_loudnorm), data=data
+            if queue[0]:
+                queue.pop(0)
+            return None
+        currentOptions = ffmpeg_options.copy()
+        if extraArgs:
+            currentOptions["before_options"] = (
+                f"{currentOptions.get('before_options', '')} {extraArgs}"
             )
+        if PERFORMANCE_MODE:
+            return cls(discord.FFmpegPCMAudio(filename, **currentOptions), data=data)
+        else:
+            return cls(discord.FFmpegPCMAudio(filename, **currentOptions), data=data)
 
 
 class Music(commands.Cog):
@@ -265,7 +278,7 @@ class Music(commands.Cog):
             except Exception as e:  # pylint: disable=broad-exception-caught
                 # if erro 403
                 log.error("Erro ao spotify playlist: %s %s", str(tries), e)
-                await asyncio.sleep(2)  # delay para evitar too many requests
+                await asyncio.sleep(5)  # delay para evitar too many requests
                 if tries >= 2:
                     raise e
 
@@ -302,7 +315,7 @@ class Music(commands.Cog):
             self.queue[guild_id].append(v)
         log.info(self.queue)
 
-    async def tocar(self, ctx: commands.Context):
+    async def tocar(self, ctx: commands.Context, extraArgs=""):
         """Inicia a tocar audio"""
 
         # Executao ao finalizar uma musica
@@ -333,12 +346,15 @@ class Music(commands.Cog):
         if self.queue[ctx.guild.id]:
             async with ctx.typing():
                 try:
-                    player = await YTDLSource.from_url(
-                        self.queue[ctx.guild.id],
-                        self.queue[ctx.guild.id][0],
-                        loop=self.bot.loop,
-                        stream=True,
-                    )
+                    player = None
+                    while player is None and self.queue[ctx.guild.id][0]:
+                        player = await YTDLSource.from_url(
+                            self.queue[ctx.guild.id],
+                            self.queue[ctx.guild.id][0],
+                            extraArgs,
+                            loop=self.bot.loop,
+                            stream=True,
+                        )
                 except Exception as e:  # pylint: disable=broad-exception-caught
                     log.error("Erro ao iniciar o player %s", e, exc_info=1)
                     player = None
@@ -411,7 +427,7 @@ class Music(commands.Cog):
                     except Exception as e:  # pylint: disable=broad-exception-caught
                         log.error("Deu ruim ao tocar! %s", e, exc_info=1)
 
-    @commands.command(aliases=["vol", "v", "volmax", "maxvol"])
+    @commands.command(aliases=["vol", "v", "volmax", "maxvol", "volmilas"])
     async def volume(self, ctx: commands.Context, *args):
         """Troca o volume.
 
@@ -443,9 +459,29 @@ class Music(commands.Cog):
             elif "-r" in args or "reset" in args or "-reset" in args:
                 ctx.voice_client.source.volume = 50 / 100
                 await ctx.send("Volume resetado")
+            elif ctx.invoked_with.lower() == "volmilas":
+                ctx.voice_client.source.volume += 4.20 / 100
+                await ctx.send(
+                    f"Volmilas subiu volume em 4.20%. Atual {ctx.voice_client.source.volume*100:.1f}%"
+                )
             else:
                 ctx.voice_client.source.volume = volume / 100
                 await ctx.send("Volume trocado para {}%".format(volume))
+
+    @commands.command(aliases=["ff", "fastforward"])
+    async def fast_forward(self, ctx: commands.Context, seconds: int):
+        """Avança o áudio atual por um número específico de segundos do video. Sempre é considerado a partir do inicio e não o momento atual
+
+        Exemplo: mgy ff 60 - Vai tocar a partir do segundo 60 do video atual
+        """
+        if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
+            ctx.voice_client._player.source = await YTDLSource.from_url(
+                self.queue[ctx.guild.id],
+                self.queue[ctx.guild.id][0],
+                f"-ss {seconds}",
+                loop=self.bot.loop,
+                stream=True,
+            )
 
     @commands.command(aliases=["gvol", "gv", "gvolmax", "gmaxvol", "alwaysvolmax"])
     async def globalvolume(self, ctx: commands.Context, *args):
@@ -629,7 +665,8 @@ class Music(commands.Cog):
                 await ctx.send("`Parando de tocar...`")
                 self.queue[ctx.guild.id].clear()
                 log.info("Desconectou terminou de tocar")
-                await ctx.voice_client.disconnect()
+                if ctx.voice_client:
+                    await ctx.voice_client.disconnect()
         except Exception as e:  # pylint: disable=broad-exception-caught
             log.error("Erro ao dar stop, %s", e, exc_info=1)
             await ctx.voice_client.disconnect()
@@ -1007,9 +1044,9 @@ class Music(commands.Cog):
         if ctx.voice_client is None:
             if ctx.author.voice:
                 # guarda o voice client para utilizar no verify alone
-                self.guild_voice_client[
-                    ctx.guild.id
-                ] = await ctx.author.voice.channel.connect()
+                self.guild_voice_client[ctx.guild.id] = (
+                    await ctx.author.voice.channel.connect()
+                )
 
                 try:
                     if not self.verifyalone.is_running():  # pylint: disable=no-member

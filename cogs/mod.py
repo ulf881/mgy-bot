@@ -60,12 +60,11 @@ class Mod(commands.Cog, name="Mod"):
         await ctx.send("```Updating & restarting, aguarde uns 10-20s...```")
         subprocess.check_call(
             [
-                "sudo",
                 "python3",
                 "-m",
                 "pip",
                 "install",
-                "--U",
+                "-U",
                 "--pre",
                 "yt-dlp[default]",
             ]
