@@ -136,7 +136,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
             log.error(
                 "Erro ao adquirir video, tentando encontrar nova na lista. Erro: %s", e
             )
-            if(queue[0]):
+            if queue[0]:
                 queue.pop(0)
             return None
         currentOptions = ffmpeg_options.copy()
@@ -461,7 +461,9 @@ class Music(commands.Cog):
                 await ctx.send("Volume resetado")
             elif ctx.invoked_with.lower() == "volmilas":
                 ctx.voice_client.source.volume += 4.20 / 100
-                await ctx.send(f"Volmilas subiu volume em 4.20%. Atual {ctx.voice_client.source.volume*100:.1f}%")
+                await ctx.send(
+                    f"Volmilas subiu volume em 4.20%. Atual {ctx.voice_client.source.volume*100:.1f}%"
+                )
             else:
                 ctx.voice_client.source.volume = volume / 100
                 await ctx.send("Volume trocado para {}%".format(volume))
