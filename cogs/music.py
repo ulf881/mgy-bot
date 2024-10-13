@@ -460,8 +460,8 @@ class Music(commands.Cog):
                 ctx.voice_client.source.volume = 50 / 100
                 await ctx.send("Volume resetado")
             elif ctx.invoked_with.lower() == "volmilas":
-                ctx.voice_client.source.volume += 4.20
-                await ctx.send(f"Volmilas subiu volume em 4.20%. Atual {ctx.voice_client.source.volume}")
+                ctx.voice_client.source.volume += 4.20 / 100
+                await ctx.send(f"Volmilas subiu volume em 4.20%. Atual {ctx.voice_client.source.volume*100:.1f}%")
             else:
                 ctx.voice_client.source.volume = volume / 100
                 await ctx.send("Volume trocado para {}%".format(volume))
@@ -663,7 +663,8 @@ class Music(commands.Cog):
                 await ctx.send("`Parando de tocar...`")
                 self.queue[ctx.guild.id].clear()
                 log.info("Desconectou terminou de tocar")
-                await ctx.voice_client.disconnect()
+                if ctx.voice_client:
+                    await ctx.voice_client.disconnect()
         except Exception as e:  # pylint: disable=broad-exception-caught
             log.error("Erro ao dar stop, %s", e, exc_info=1)
             await ctx.voice_client.disconnect()
