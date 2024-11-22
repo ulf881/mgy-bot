@@ -460,7 +460,14 @@ class Music(commands.Cog):
                 ctx.voice_client.source.volume = 50 / 100
                 await ctx.send("Volume resetado")
             elif ctx.invoked_with.lower() == "volmilas":
-                ctx.voice_client.source.volume += 4.20 / 100
+                # Usa o volume passado pra quantidade de volmilas
+                if args:
+                    if args[0].isdigit():
+                        ctx.voice_client.source.volume += (4.20 * int(args[0])) / 100
+                        return await ctx.send(
+                            f"Volmilas subiu volume em 4.20% (x{args[0]}). Atual {ctx.voice_client.source.volume*100:.1f}%"
+                        )
+                ctx.voice_client.source.volume += (4.20) / 100
                 await ctx.send(
                     f"Volmilas subiu volume em 4.20%. Atual {ctx.voice_client.source.volume*100:.1f}%"
                 )
@@ -483,7 +490,9 @@ class Music(commands.Cog):
                 stream=True,
             )
 
-    @commands.command(aliases=["gvol", "gv", "gvolmax", "gmaxvol", "alwaysvolmax"])
+    @commands.command(
+        aliases=["gvol", "gv", "gvolmax", "gmaxvol", "alwaysvolmax", "gvolmilas"]
+    )
     async def globalvolume(self, ctx: commands.Context, *args):
         """Troca o volume.
 
@@ -518,6 +527,18 @@ class Music(commands.Cog):
             self.global_vol[ctx.guild.id] = 50 / 100
             volume = 50 / 100
             await ctx.send("Volume global resetado")
+        elif ctx.invoked_with.lower() == "volmilas":
+            # Usa o volume passado pra quantidade de volmilas
+            if args[0].isdigit():
+                ctx.voice_client.source.volume += (4.20 * volume) / 100
+                await ctx.send(
+                    f"Volmilas subiu volume em 4.20% (x{volume}). Atual {ctx.voice_client.source.volume*100:.1f}%"
+                )
+            else:
+                ctx.voice_client.source.volume += (4.20 * volume) / 100
+                await ctx.send(
+                    f"Volmilas subiu volume em 4.20%. Atual {ctx.voice_client.source.volume*100:.1f}%"
+                )
         else:
             self.global_vol[ctx.guild.id] = volume / 100
             await ctx.send("Volume global trocado para {}%".format(volume))
