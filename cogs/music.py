@@ -113,7 +113,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
             # Percorre a queue até encontrar um item valido
             while not data:
-                if queue[1]:
+                if len(queue) > 1:
                     queue.pop(0)
                     url = queue[0]
                     data = await loop.run_in_executor(
