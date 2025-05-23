@@ -26,7 +26,7 @@ MAX_NUM = 100000
 log = logging.getLogger("music")
 
 # Suppress noise about console usage from errors
-yt_dlp.utils.bug_reports_message = lambda: ""
+# yt_dlp.utils.bug_reports_message = lambda: ""
 
 ytdl_format_options = {
     "format": "bestaudio/best",
@@ -108,9 +108,8 @@ class YTDLSource(discord.PCMVolumeTransformer):
         loop = loop or asyncio.get_event_loop()
         try:
             data = await loop.run_in_executor(
-                None, lambda: ytdl.extract_info(url, download=not stream)
-            )
-
+                 None, lambda *args, **kwargs: ytdl.extract_info(url, download=not stream)
+	    )
             # Percorre a queue até encontrar um item valido
             while not data:
                 if len(queue) > 1:
@@ -347,7 +346,7 @@ class Music(commands.Cog):
             async with ctx.typing():
                 try:
                     player = None
-                    while player is None and self.queue[ctx.guild.id][0]:
+                    while player is None and self.queue[ctx.guild.id] and self.queue[ctx.guild.id][0]:
                         player = await YTDLSource.from_url(
                             self.queue[ctx.guild.id],
                             self.queue[ctx.guild.id][0],
