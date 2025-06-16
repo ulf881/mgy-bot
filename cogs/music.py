@@ -9,6 +9,7 @@ import sys
 import random
 import re
 import logging
+from typing import List
 from urllib.parse import parse_qs, urlparse
 import discord
 import yt_dlp
@@ -98,56 +99,59 @@ class YTDLSource(discord.PCMVolumeTransformer):
     @classmethod
     async def from_url(
         cls,
-        queue: dict,
-        url: str,
+        queue: List[str],
         extraArgs: str,
         loop=None,
         stream=False,
     ):
-        """Retira informações da url"""
+        """Retira informações da URL e lida com a fila."""
         loop = loop or asyncio.get_event_loop()
+        data = None
+
+        while queue:
+            try:
+                current_url = queue.pop(0)
+
+                data = await loop.run_in_executor(
+                    None, lambda: ytdl.extract_info(current_url, download=not stream)
+                )
+
+                if data and "entries" in data:
+                    data = data["entries"][0]
+
+                if data:
+                    break
+
+            except Exception as e:
+                log.error("Erro ao adquirir vídeo da URL '%s': %s", current_url, e)
+
+            await asyncio.sleep(2)  # small delay before next try
+        else:
+            # Queue exhausted without valid data
+            log.warning("Nenhuma URL válida encontrada na fila.")
+            return None
+
         try:
-            data = await loop.run_in_executor(
-                None,
-                lambda *args, **kwargs: ytdl.extract_info(url, download=not stream),
-            )
-            # Percorre a queue até encontrar um item valido
-            while not data:
-                if len(queue) > 1:
-                    queue.pop(0)
-                    url = queue[0]
-                    data = await loop.run_in_executor(
-                        None, lambda: ytdl.extract_info(url, download=not stream)
-                    )
-                else:
-                    return None
-                if not data:
-                    await asyncio.sleep(2)  # delay para evitar too many requests
-
-            # util para busca por nome de musica
-            if "entries" in data:
-                data = data["entries"][0]
-
             filename = data["url"] if stream else ytdl.prepare_filename(data)
-        except IndexError as error:
-            log.error("Lista vazia %s", str(error))
-            return None
         except Exception as e:
-            log.error(
-                "Erro ao adquirir video, tentando encontrar nova na lista. Erro: %s", e
-            )
-            if queue[0]:
-                queue.pop(0)
+            log.error("Erro ao preparar filename: %s", e)
             return None
-        currentOptions = ffmpeg_options.copy()
+
+        # Escolhe opções de FFmpeg com base no PERFORMANCE_MODE
+        currentOptions = (
+            ffmpeg_options if PERFORMANCE_MODE else ffmpeg_options_loudnorm
+        ).copy()
         if extraArgs:
             currentOptions["before_options"] = (
                 f"{currentOptions.get('before_options', '')} {extraArgs}"
             )
-        if PERFORMANCE_MODE:
-            return cls(discord.FFmpegPCMAudio(filename, **currentOptions), data=data)
-        else:
-            return cls(discord.FFmpegPCMAudio(filename, **currentOptions), data=data)
+
+        try:
+            audio_source = discord.FFmpegPCMAudio(filename, **currentOptions)
+            return cls(audio_source, data=data)
+        except Exception as e:
+            log.error("Erro ao criar FFmpegPCMAudio: %s", e)
+            return None
 
 
 class Music(commands.Cog):
@@ -349,12 +353,12 @@ class Music(commands.Cog):
                     player = None
                     while (
                         player is None
+                        and self.queue
                         and self.queue[ctx.guild.id]
                         and self.queue[ctx.guild.id][0]
                     ):
                         player = await YTDLSource.from_url(
                             self.queue[ctx.guild.id],
-                            self.queue[ctx.guild.id][0],
                             extraArgs,
                             loop=self.bot.loop,
                             stream=True,
@@ -362,7 +366,7 @@ class Music(commands.Cog):
                 except Exception as e:  # pylint: disable=broad-exception-caught
                     log.error("Erro ao iniciar o player %s", e, exc_info=1)
                     player = None
-                if player:
+                if player and ctx.voice_client:
                     # Inicia a tocar
                     try:
                         ctx.voice_client.play(player, after=nextOrCleanUp)
@@ -488,7 +492,6 @@ class Music(commands.Cog):
         if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
             ctx.voice_client._player.source = await YTDLSource.from_url(
                 self.queue[ctx.guild.id],
-                self.queue[ctx.guild.id][0],
                 f"-ss {seconds}",
                 loop=self.bot.loop,
                 stream=True,
