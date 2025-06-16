@@ -4,6 +4,8 @@
 
 import logging
 import os
+from random import randint
+import re
 import sys
 import subprocess
 
@@ -270,6 +272,26 @@ class Mod(commands.Cog, name="Mod"):
         await ctx.send(
             "Colabore com o desenvolvimento do bot: https://github.com/ulf881/mgy-bot"
         )
+
+    @commands.command(aliases=["dice", "dado", "rand", "rolar"])
+    async def roll(self, ctx: commands.Context, dice: str):
+        """Roda um dado no formato [quantidade]d[faces]
+        exemplo: mgy roll 2d6
+        exemplo2: mgy roll d20
+        """
+        # Regex to match the pattern, defaulting to 1 if no number is found before 'D'
+        match = re.match(r"(\d*)d(\d+)", dice, re.IGNORECASE)
+
+        if match:
+            first_number = int(match.group(1)) if match.group(1) else 1
+            second_number = int(match.group(2))
+        else:
+            return await ctx.send(
+                "Dado invalido. Utilize mgy roll [quantidade]d[faces]"
+            )
+
+        for i in range(first_number):
+            await ctx.send(print(randint(1, second_number)))
 
 
 async def setup(bot: commands.Bot):

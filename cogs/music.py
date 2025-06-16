@@ -1,5 +1,5 @@
 """
-    Modulo para comandos de musica
+Modulo para comandos de musica
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ MAX_NUM = 100000
 log = logging.getLogger("music")
 
 # Suppress noise about console usage from errors
-yt_dlp.utils.bug_reports_message = lambda: ""
+# yt_dlp.utils.bug_reports_message = lambda: ""
 
 ytdl_format_options = {
     "format": "bestaudio/best",
@@ -108,12 +108,12 @@ class YTDLSource(discord.PCMVolumeTransformer):
         loop = loop or asyncio.get_event_loop()
         try:
             data = await loop.run_in_executor(
-                None, lambda: ytdl.extract_info(url, download=not stream)
+                None,
+                lambda *args, **kwargs: ytdl.extract_info(url, download=not stream),
             )
-
             # Percorre a queue até encontrar um item valido
             while not data:
-                if queue[1]:
+                if len(queue) > 1:
                     queue.pop(0)
                     url = queue[0]
                     data = await loop.run_in_executor(
@@ -347,7 +347,11 @@ class Music(commands.Cog):
             async with ctx.typing():
                 try:
                     player = None
-                    while player is None and self.queue[ctx.guild.id][0]:
+                    while (
+                        player is None
+                        and self.queue[ctx.guild.id]
+                        and self.queue[ctx.guild.id][0]
+                    ):
                         player = await YTDLSource.from_url(
                             self.queue[ctx.guild.id],
                             self.queue[ctx.guild.id][0],
@@ -461,16 +465,16 @@ class Music(commands.Cog):
                 await ctx.send("Volume resetado")
             elif ctx.invoked_with.lower() == "volmilas":
                 # Usa o volume passado pra quantidade de volmilas
-                if args[0].isdigit():
-                    ctx.voice_client.source.volume += (4.20 * volume) / 100
-                    await ctx.send(
-                        f"Volmilas subiu volume em 4.20% (x{volume}). Atual {ctx.voice_client.source.volume*100:.1f}%"
-                    )
-                else:
-                    ctx.voice_client.source.volume += (4.20 * volume) / 100
-                    await ctx.send(
-                        f"Volmilas subiu volume em 4.20%. Atual {ctx.voice_client.source.volume*100:.1f}%"
-                    )
+                if args:
+                    if args[0].isdigit():
+                        ctx.voice_client.source.volume += (4.20 * int(args[0])) / 100
+                        return await ctx.send(
+                            f"Volmilas subiu volume em 4.20% (x{args[0]}). Atual {ctx.voice_client.source.volume*100:.1f}%"
+                        )
+                ctx.voice_client.source.volume += (4.20) / 100
+                await ctx.send(
+                    f"Volmilas subiu volume em 4.20%. Atual {ctx.voice_client.source.volume*100:.1f}%"
+                )
             else:
                 ctx.voice_client.source.volume = volume / 100
                 await ctx.send("Volume trocado para {}%".format(volume))
