@@ -110,7 +110,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
         while queue:
             try:
-                current_url = queue.pop(0)
+                current_url = queue[0]
 
                 data = await loop.run_in_executor(
                     None, lambda: ytdl.extract_info(current_url, download=not stream)
@@ -121,9 +121,10 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
                 if data:
                     break
-
             except Exception as e:
                 log.error("Erro ao adquirir vídeo da URL '%s': %s", current_url, e)
+            finally:
+                queue.pop(0)
 
             await asyncio.sleep(2)  # small delay before next try
         else:
@@ -355,7 +356,7 @@ class Music(commands.Cog):
                         player is None
                         and self.queue
                         and self.queue[ctx.guild.id]
-                        and self.queue[ctx.guild.id][0]
+                        and len(self.queue[ctx.guild.id]) > 0
                     ):
                         player = await YTDLSource.from_url(
                             self.queue[ctx.guild.id],
