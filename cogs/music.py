@@ -121,10 +121,10 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
                 if data:
                     break
-            except Exception as e:
-                log.error("Erro ao adquirir vídeo da URL '%s': %s", current_url, e)
-            finally:
                 queue.pop(0)
+            except Exception as e:
+                queue.pop(0)
+                log.error("Erro ao adquirir vídeo da URL '%s': %s", current_url, e)
 
             await asyncio.sleep(2)  # small delay before next try
         else:
