@@ -399,8 +399,13 @@ class Music(commands.Cog):
                                 + player.title
                                 + "]"
                                 + "("
-                                + self.queue[ctx.guild.id][0]
+                                + player.data["original_url"]
                                 + ")"
+                                + (
+                                    ""
+                                    if await self.is_url(self.queue[ctx.guild.id][0])
+                                    else " - Pesquisado: " + self.queue[ctx.guild.id][0]
+                                )
                                 + "\n Duração: {:02d}:{:02d}\nAinda na lista: {}".format(
                                     int(minutes),
                                     int(seconds),
@@ -418,8 +423,13 @@ class Music(commands.Cog):
                                 + player.title
                                 + "]"
                                 + "("
-                                + self.queue[ctx.guild.id][0]
+                                + player.data["original_url"]
                                 + ")"
+                                + (
+                                    ""
+                                    if await self.is_url(self.queue[ctx.guild.id][0])
+                                    else " - Pesquisado: " + self.queue[ctx.guild.id][0]
+                                )
                                 + "\n Duração: {:02d}:{:02d}".format(
                                     int(minutes), int(seconds)
                                 ),
@@ -610,8 +620,8 @@ class Music(commands.Cog):
             log.info("Esta tocando, adicionando a queue")
 
             await ctx.send(
-                "```Adicionado à lista, posição: {}```".format(
-                    len(self.queue[ctx.guild.id]) - 1
+                "```Adicionado à fila, posição: {}```".format(
+                    1 if "-f" in args else len(self.queue[ctx.guild.id]) - 1
                 )
             )
         else:
