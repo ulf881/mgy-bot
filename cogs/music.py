@@ -404,7 +404,7 @@ class Music(commands.Cog):
                                 + (
                                     ""
                                     if await self.is_url(self.queue[ctx.guild.id][0])
-                                    else " - Pesquisado: " + self.queue[ctx.guild.id][0]
+                                    else "\n Pesquisado: " + self.queue[ctx.guild.id][0]
                                 )
                                 + "\n Duração: {:02d}:{:02d}\nAinda na lista: {}".format(
                                     int(minutes),
@@ -428,7 +428,7 @@ class Music(commands.Cog):
                                 + (
                                     ""
                                     if await self.is_url(self.queue[ctx.guild.id][0])
-                                    else " - Pesquisado: " + self.queue[ctx.guild.id][0]
+                                    else "\n Pesquisado: " + self.queue[ctx.guild.id][0]
                                 )
                                 + "\n Duração: {:02d}:{:02d}".format(
                                     int(minutes), int(seconds)
