@@ -50,7 +50,7 @@ ytdl_format_options = {
 }
 
 ffmpeg_options = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    "before_options": "-nostdin -re -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn -sn -dn",
 }
 
@@ -765,7 +765,7 @@ class Music(commands.Cog):
                         else:
                             titulo = x
                     else:
-                        titulo = "¯\_(ツ)_/¯"  # pylint: disable=anomalous-backslash-in-string # noqa: W605
+                        titulo = r"¯\_(ツ)_/¯"
 
                     lista += str(j) + ": " + titulo + "\n"
                     j += 1

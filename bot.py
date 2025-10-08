@@ -1,6 +1,7 @@
 """
-    Bot MGY para discord, toca musica e zoa com o max
+Bot MGY para discord, toca musica e zoa com o max
 """
+
 import sys
 import asyncio
 import logging
