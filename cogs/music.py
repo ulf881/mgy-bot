@@ -224,7 +224,7 @@ class Music(commands.Cog):
         """
         async with ctx.typing():
             if not args:
-                self.equalizer_options.pop(ctx.guild.id, None)
+                self.equalizer_options[ctx.guild.id] = None
                 self.global_vol[ctx.guild.id] = 50 / 100
             if args[0] == "bass":
                 self.equalizer_options[ctx.guild.id] = (
@@ -237,6 +237,11 @@ class Music(commands.Cog):
             elif args[0] == "earrape":
                 self.equalizer_options[ctx.guild.id] = '-filter:a "volume=20" -b:a 24k'
                 self.global_vol[ctx.guild.id] = sys.float_info.max
+            else:
+                # Default also remove equalizer
+                args = None
+                self.equalizer_options[ctx.guild.id] = None
+                self.global_vol[ctx.guild.id] = 50 / 100
             # TODO - Allow custom filter
             if ctx.voice_client.is_playing():
                 elapsed = time.monotonic() - self.guild_start_time[ctx.guild.id]
