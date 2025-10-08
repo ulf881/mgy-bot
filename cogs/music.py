@@ -215,23 +215,23 @@ class Music(commands.Cog):
             )
 
     @commands.command(hidden=True)
-    async def equalizer(self, ctx: commands.Context, mode: str | None, value: int):
+    async def equalizer(self, ctx: commands.Context, *args):
         """Configurações de equalizador"""
-        if mode == "bass":
+        if not args:
+            self.equalizer_options.pop(ctx.guild.id, None)
+            return await ctx.send(f"Equalizador resetado")
+        if args[0] == "bass":
             self.equalizer_options[ctx.guild.id] = (
-                f"bass=g={value}" if value else "bass=g=10" + ":f=100:w=0.8"
+                f"bass=g={args[1]}" if args[1] else "bass=g=10" + ":f=100:w=0.8"
             )
-        elif mode == "equalize":
+        elif args[0] == "equalize":
             self.equalizer_options[ctx.guild.id] = "-filter:a loudnorm"
-        elif mode == "earrape":
+        elif args[0] == "earrape":
             # TODO - Make it in realtime
             self.equalizer_options[ctx.guild.id] = '-filter:a "volume=10" -b:a 64k'
             self.global_vol[ctx.guild.id] = sys.float_info.max
-        else:
-            self.equalizer_options.pop(ctx.guild.id, None)
-            return await ctx.send(f"Equalizador resetado")
 
-        await ctx.send(f"Equalizador {mode} ativo")
+        await ctx.send(f"Equalizador {args[0]} ativo")
 
     @commands.command(hidden=True)
     async def join(self, ctx: commands.Context, *, channel: discord.VoiceChannel):
