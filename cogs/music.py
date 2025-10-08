@@ -219,7 +219,9 @@ class Music(commands.Cog):
 
     @commands.command(hidden=True)
     async def equalizer(self, ctx: commands.Context, *args):
-        """Configurações de equalizador"""
+        """Configurações de equalizador.
+        Modos: bass, normalize, earrape, ou vazio para desativar
+        """
         async with ctx.typing():
             if not args:
                 self.equalizer_options.pop(ctx.guild.id, None)
@@ -229,7 +231,7 @@ class Music(commands.Cog):
                     f'-filter:a "bass=g=10:f=100:w=0.8"'
                 )
                 self.global_vol[ctx.guild.id] = 50 / 100
-            elif args[0] == "equalize":
+            elif args[0] == "normalize":
                 self.equalizer_options[ctx.guild.id] = "-filter:a loudnorm"
                 self.global_vol[ctx.guild.id] = 50 / 100
             elif args[0] == "earrape":
