@@ -18,6 +18,8 @@ from spotipy.oauth2 import SpotifyClientCredentials
 from discord.ext import tasks, commands
 import googleapiclient.discovery
 from bs4 import BeautifulSoup
+import time
+
 
 from utils.pgdatabase import Postgres
 
@@ -165,6 +167,7 @@ class Music(commands.Cog):
         self.equalizer_options = {}  # equalizer config
         self.message = {}  # mensagem 'playing' por guild
         self.guild_voice_client = {}  # lista de voice client de guild
+        self.guild_start_time = {}
 
     async def is_url(self, url: str):
         """Verifica se string é uma url"""
@@ -228,11 +231,17 @@ class Music(commands.Cog):
             self.equalizer_options[ctx.guild.id] = "-filter:a loudnorm"
             self.global_vol[ctx.guild.id] = 50 / 100
         elif args[0] == "earrape":
-            # TODO - Make it in realtime
             self.equalizer_options[ctx.guild.id] = '-filter:a "volume=20" -b:a 24k'
             self.global_vol[ctx.guild.id] = sys.float_info.max
         # TODO - Allow custom filter
-
+        if ctx.voice_client.is_playing():
+            elapsed = time.monotonic() - self.guild_start_time[ctx.guild.id]
+            ctx.voice_client._player.source = await YTDLSource.from_url(
+                self.queue[ctx.guild.id],
+                f"-ss {elapsed}",
+                loop=self.bot.loop,
+                stream=True,
+            )
         await ctx.send(f"Equalizador {args[0]} ativo")
 
     @commands.command(hidden=True)
@@ -375,6 +384,7 @@ class Music(commands.Cog):
                             loop=self.bot.loop,
                             stream=True,
                         )
+
                 except Exception as e:  # pylint: disable=broad-exception-caught
                     log.error("Erro ao iniciar o player %s", e, exc_info=1)
                     player = None
@@ -382,7 +392,7 @@ class Music(commands.Cog):
                     # Inicia a tocar
                     try:
                         ctx.voice_client.play(player, after=nextOrCleanUp)
-
+                        self.guild_start_time[ctx.guild.id] = time.monotonic()
                         # Bonus room
                         if player.title == "Bonus Room Blitz - Donkey Kong Country":
                             self.enableDoubleXP()
