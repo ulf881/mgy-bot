@@ -144,7 +144,8 @@ class Eventos(commands.Cog, name="Eventos"):
         if message.content == "novo":
             await message.channel.purge(limit=1)
             await message.channel.send(
-                f"Só estou passando aqui pra desejar um feliz ano novo! E lembrar o que {os.environ["MACRO"]}"
+                "Só estou passando aqui pra desejar um feliz ano novo! E lembrar o que "
+                + os.environ["MACRO"]
             )
 
         # Verifica se esta in game
