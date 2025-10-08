@@ -221,9 +221,7 @@ class Music(commands.Cog):
             self.equalizer_options.pop(ctx.guild.id, None)
             return await ctx.send(f"Equalizador resetado")
         if args[0] == "bass":
-            self.equalizer_options[ctx.guild.id] = (
-                f"bass=g={args[1]}" if args[1] else "bass=g=10" + ":f=100:w=0.8"
-            )
+            self.equalizer_options[ctx.guild.id] = f'-filter:a "bass=g=10:f=100:w=0.8"'
         elif args[0] == "equalize":
             self.equalizer_options[ctx.guild.id] = "-filter:a loudnorm"
         elif args[0] == "earrape":
