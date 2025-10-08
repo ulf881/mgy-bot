@@ -1,9 +1,10 @@
 """
-    Modulo cuidar dos eventos on_SOMETHING
+Modulo cuidar dos eventos on_SOMETHING
 """
 
 import io
 import logging
+import os
 from random import randint
 from datetime import datetime, timedelta
 import aiohttp
@@ -132,7 +133,7 @@ class Eventos(commands.Cog, name="Eventos"):
 
         if message.content == "mgy":
             await message.channel.purge(limit=1)
-            await message.channel.send("Max Gay Yeah!")
+            await message.channel.send(os.environ["MACRO"])
 
         if message.content == "lenny":
             # await message.delete()
@@ -143,7 +144,7 @@ class Eventos(commands.Cog, name="Eventos"):
         if message.content == "novo":
             await message.channel.purge(limit=1)
             await message.channel.send(
-                "Só estou passando aqui pra desejar um feliz ano novo! E lembrar o que o Max Gay. Bittenca Viadin. Jonas Líder. 24 Deus. Isaac Best Game."
+                f"Só estou passando aqui pra desejar um feliz ano novo! E lembrar o que {os.environ["MACRO"]}"
             )
 
         # Verifica se esta in game

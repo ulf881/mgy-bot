@@ -1,6 +1,7 @@
 """
-    Modulo com comandos para zuar o max
+Modulo com comandos para zuar o max
 """
+
 import io
 import logging
 import aiohttp

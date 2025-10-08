@@ -1,6 +1,7 @@
 """
-    Modulo para criação de logs
+Modulo para criação de logs
 """
+
 import logging
 from logging.handlers import RotatingFileHandler
 
@@ -9,7 +10,7 @@ from logging.handlers import RotatingFileHandler
 logging.raiseExceptions = False
 
 log = logging.getLogger("")
-log.setLevel(logging.DEBUG)
+log.setLevel(logging.INFO)
 
 log_formatter = logging.Formatter(
     "%(asctime)s - %(levelname)s - %(name)s[%(funcName)s(%(lineno)d)] - %(message)s"

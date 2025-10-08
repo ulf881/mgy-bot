@@ -1,6 +1,7 @@
 """
-    Modulo cuidar dos niveis dos usuarios
+Modulo cuidar dos niveis dos usuarios
 """
+
 import os
 import logging
 import discord

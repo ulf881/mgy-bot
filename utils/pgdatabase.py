@@ -1,4 +1,5 @@
-""" Modulo para acesso ao banco de dados """
+"""Modulo para acesso ao banco de dados"""
+
 import os
 import logging
 import psycopg2

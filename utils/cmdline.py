@@ -1,6 +1,7 @@
 """
-    Prepara argumentos e banner do programa
+Prepara argumentos e banner do programa
 """
+
 import logging
 from utils import __version__, __program__, __author__, __email__
 

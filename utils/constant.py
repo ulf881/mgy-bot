@@ -1,6 +1,7 @@
 """
-    Modulo contendo as constantes necessárias
+Modulo contendo as constantes necessárias
 """
+
 # coding: utf-8
 from __future__ import unicode_literals, print_function
 

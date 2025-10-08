@@ -1,5 +1,5 @@
 """
-    Modulo para games. AKA CrappyDungeon
+Modulo para games. AKA CrappyDungeon
 """
 
 import logging
