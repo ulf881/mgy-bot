@@ -406,14 +406,14 @@ class Music(commands.Cog):
                         log.info("Tocando %s", player.title)
 
                         if player.duration:
-                            time = float(player.duration)
-                            minutes = time // 60
-                            time %= 60
-                            seconds = time
+                            current_time = float(player.duration)
+                            minutes = current_time // 60
+                            current_time %= 60
+                            seconds = current_time
                         else:
-                            time = 24
+                            current_time = 24
                             minutes = 24
-                            seconds = time
+                            seconds = current_time
                         if len(self.queue[ctx.guild.id]) > 1:
                             embed = discord.Embed(
                                 description="["
