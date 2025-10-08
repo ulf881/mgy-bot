@@ -220,30 +220,34 @@ class Music(commands.Cog):
     @commands.command(hidden=True)
     async def equalizer(self, ctx: commands.Context, *args):
         """Configurações de equalizador"""
-        if not args:
-            self.equalizer_options.pop(ctx.guild.id, None)
-            self.global_vol[ctx.guild.id] = 50 / 100
-            return await ctx.send(f"Equalizador resetado")
-        if args[0] == "bass":
-            self.equalizer_options[ctx.guild.id] = f'-filter:a "bass=g=10:f=100:w=0.8"'
-            self.global_vol[ctx.guild.id] = 50 / 100
-        elif args[0] == "equalize":
-            self.equalizer_options[ctx.guild.id] = "-filter:a loudnorm"
-            self.global_vol[ctx.guild.id] = 50 / 100
-        elif args[0] == "earrape":
-            self.equalizer_options[ctx.guild.id] = '-filter:a "volume=20" -b:a 24k'
-            self.global_vol[ctx.guild.id] = sys.float_info.max
-        # TODO - Allow custom filter
-        if ctx.voice_client.is_playing():
-            elapsed = time.monotonic() - self.guild_start_time[ctx.guild.id]
-            ctx.voice_client._player.source = await YTDLSource.from_url(
-                self.queue[ctx.guild.id],
-                f"-ss {elapsed}",
-                self.equalizer_options.get(ctx.guild.id, ""),
-                loop=self.bot.loop,
-                stream=True,
-            )
-        await ctx.send(f"Equalizador {args[0]} ativo")
+        async with ctx.typing():
+            if not args:
+                self.equalizer_options.pop(ctx.guild.id, None)
+                self.global_vol[ctx.guild.id] = 50 / 100
+            if args[0] == "bass":
+                self.equalizer_options[ctx.guild.id] = (
+                    f'-filter:a "bass=g=10:f=100:w=0.8"'
+                )
+                self.global_vol[ctx.guild.id] = 50 / 100
+            elif args[0] == "equalize":
+                self.equalizer_options[ctx.guild.id] = "-filter:a loudnorm"
+                self.global_vol[ctx.guild.id] = 50 / 100
+            elif args[0] == "earrape":
+                self.equalizer_options[ctx.guild.id] = '-filter:a "volume=20" -b:a 24k'
+                self.global_vol[ctx.guild.id] = sys.float_info.max
+            # TODO - Allow custom filter
+            if ctx.voice_client.is_playing():
+                elapsed = time.monotonic() - self.guild_start_time[ctx.guild.id]
+                ctx.voice_client._player.source = await YTDLSource.from_url(
+                    self.queue[ctx.guild.id],
+                    f"-ss {elapsed}",
+                    self.equalizer_options.get(ctx.guild.id, ""),
+                    loop=self.bot.loop,
+                    stream=True,
+                )
+            if not args:
+                await ctx.send("Equalizador desativado")
+            await ctx.send(f"Equalizador {args[0]} ativo")
 
     @commands.command(hidden=True)
     async def join(self, ctx: commands.Context, *, channel: discord.VoiceChannel):
