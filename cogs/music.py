@@ -226,7 +226,7 @@ class Music(commands.Cog):
             if not args:
                 self.equalizer_options[ctx.guild.id] = None
                 self.global_vol[ctx.guild.id] = 50 / 100
-            if args[0] == "bass":
+            elif args[0] == "bass":
                 self.equalizer_options[ctx.guild.id] = (
                     f'-filter:a "bass=g=10:f=100:w=0.8"'
                 )
@@ -243,7 +243,7 @@ class Music(commands.Cog):
                 self.equalizer_options[ctx.guild.id] = None
                 self.global_vol[ctx.guild.id] = 50 / 100
             # TODO - Allow custom filter
-            if ctx.voice_client.is_playing():
+            if ctx.voice_client and ctx.voice_client.is_playing():
                 elapsed = time.monotonic() - self.guild_start_time[ctx.guild.id]
                 ctx.voice_client._player.source = await YTDLSource.from_url(
                     self.queue[ctx.guild.id],
@@ -253,7 +253,7 @@ class Music(commands.Cog):
                     stream=True,
                 )
             if not args:
-                await ctx.send("Equalizador desativado")
+                return await ctx.send("Equalizador desativado")
             await ctx.send(f"Equalizador {args[0]} ativo")
 
     @commands.command(hidden=True)
