@@ -239,6 +239,7 @@ class Music(commands.Cog):
             ctx.voice_client._player.source = await YTDLSource.from_url(
                 self.queue[ctx.guild.id],
                 f"-ss {elapsed}",
+                self.equalizer_options.get(ctx.guild.id, ""),
                 loop=self.bot.loop,
                 stream=True,
             )
@@ -525,6 +526,7 @@ class Music(commands.Cog):
             ctx.voice_client._player.source = await YTDLSource.from_url(
                 self.queue[ctx.guild.id],
                 f"-ss {seconds}",
+                self.equalizer_options.get(ctx.guild.id, ""),
                 loop=self.bot.loop,
                 stream=True,
             )
