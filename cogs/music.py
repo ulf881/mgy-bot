@@ -43,7 +43,7 @@ ytdl_format_options = {
     "default_search": "auto",
     # bind to ipv4 since ipv6 addresses cause issues sometimes
     "source_address": "0.0.0.0",
-    "verbose": True,
+    "verbose": False,
     "cookiefile": "cookies.txt",
 }
 
@@ -219,15 +219,19 @@ class Music(commands.Cog):
         """Configurações de equalizador"""
         if not args:
             self.equalizer_options.pop(ctx.guild.id, None)
+            self.global_vol[ctx.guild.id] = 50 / 100
             return await ctx.send(f"Equalizador resetado")
         if args[0] == "bass":
             self.equalizer_options[ctx.guild.id] = f'-filter:a "bass=g=10:f=100:w=0.8"'
+            self.global_vol[ctx.guild.id] = 50 / 100
         elif args[0] == "equalize":
             self.equalizer_options[ctx.guild.id] = "-filter:a loudnorm"
+            self.global_vol[ctx.guild.id] = 50 / 100
         elif args[0] == "earrape":
             # TODO - Make it in realtime
-            self.equalizer_options[ctx.guild.id] = '-filter:a "volume=10" -b:a 64k'
+            self.equalizer_options[ctx.guild.id] = '-filter:a "volume=20" -b:a 24k'
             self.global_vol[ctx.guild.id] = sys.float_info.max
+        # TODO - Allow custom filter
 
         await ctx.send(f"Equalizador {args[0]} ativo")
 
