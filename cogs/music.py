@@ -47,16 +47,9 @@ ytdl_format_options = {
     "cookiefile": "cookies.txt",
 }
 
-PERFORMANCE_MODE = True
-
 ffmpeg_options = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn -sn -dn",
-}
-
-ffmpeg_options_loudnorm = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn -sn -dn -filter:a loudnorm",
 }
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
@@ -100,7 +93,8 @@ class YTDLSource(discord.PCMVolumeTransformer):
     async def from_url(
         cls,
         queue: List[str],
-        extraArgs: str,
+        extraBeforeOptions: str,
+        extraOptions: str,
         loop=None,
         stream=False,
     ):
@@ -138,13 +132,15 @@ class YTDLSource(discord.PCMVolumeTransformer):
             log.error("Erro ao preparar filename: %s", e)
             return None
 
-        # Escolhe opções de FFmpeg com base no PERFORMANCE_MODE
-        currentOptions = (
-            ffmpeg_options if PERFORMANCE_MODE else ffmpeg_options_loudnorm
-        ).copy()
-        if extraArgs:
+        # Escolhe opções de FFmpeg com base no equalizador e skip
+        currentOptions = (ffmpeg_options).copy()
+        if extraBeforeOptions:
             currentOptions["before_options"] = (
-                f"{currentOptions.get('before_options', '')} {extraArgs}"
+                f"{currentOptions.get('before_options', '')} {extraBeforeOptions}"
+            )
+        if extraOptions:
+            currentOptions["options"] = (
+                f"{currentOptions.get('options', '')} {extraOptions}"
             )
 
         try:
@@ -166,6 +162,7 @@ class Music(commands.Cog):
         self.title = {}  # titulo da musica por guild
         self.queue = {}  # lista de musica por guild
         self.global_vol = {}  # volume global
+        self.equalizer_options = {}  # equalizer config
         self.message = {}  # mensagem 'playing' por guild
         self.guild_voice_client = {}  # lista de voice client de guild
 
@@ -218,12 +215,23 @@ class Music(commands.Cog):
             )
 
     @commands.command(hidden=True)
-    async def perf(self, ctx: commands.Context):
-        """Disable filter for perfomance"""
-        global PERFORMANCE_MODE  # pylint: disable=global-statement
+    async def equalizer(self, ctx: commands.Context, mode: str | None, value: int):
+        """Configurações de equalizador"""
+        if mode == "bass":
+            self.equalizer_options[ctx.guild.id] = (
+                f"bass=g={value}" if value else "bass=g=10" + ":f=100:w=0.8"
+            )
+        elif mode == "equalize":
+            self.equalizer_options[ctx.guild.id] = "-filter:a loudnorm"
+        elif mode == "earrape":
+            # TODO - Make it in realtime
+            self.equalizer_options[ctx.guild.id] = '-filter:a "volume=10" -b:a 64k'
+            self.global_vol[ctx.guild.id] = sys.float_info.max
+        else:
+            self.equalizer_options.pop(ctx.guild.id, None)
+            return await ctx.send(f"Equalizador resetado")
 
-        PERFORMANCE_MODE = not PERFORMANCE_MODE
-        await ctx.send(PERFORMANCE_MODE)
+        await ctx.send(f"Equalizador {mode} ativo")
 
     @commands.command(hidden=True)
     async def join(self, ctx: commands.Context, *, channel: discord.VoiceChannel):
@@ -320,7 +328,7 @@ class Music(commands.Cog):
             self.queue[guild_id].append(v)
         log.info(self.queue)
 
-    async def tocar(self, ctx: commands.Context, extraArgs=""):
+    async def tocar(self, ctx: commands.Context, extraBeforeOptions=""):
         """Inicia a tocar audio"""
 
         # Executao ao finalizar uma musica
@@ -360,7 +368,8 @@ class Music(commands.Cog):
                     ):
                         player = await YTDLSource.from_url(
                             self.queue[ctx.guild.id],
-                            extraArgs,
+                            extraBeforeOptions,
+                            self.equalizer_options.get(ctx.guild.id, ""),
                             loop=self.bot.loop,
                             stream=True,
                         )
