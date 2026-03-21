@@ -12,6 +12,7 @@ import logging
 from typing import List
 from urllib.parse import parse_qs, urlparse
 import discord
+import requests
 import yt_dlp
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
@@ -276,8 +277,52 @@ class Music(commands.Cog):
             random.shuffle(self.queue[ctx.guild.id])
         await ctx.send("```Alterado a ordem da lista de musica```")
 
+    async def spotifyplaylistembed(self, guild_id: int, pagina: int):
+        """Separa musicas da playlist utilizando scraper do embed do spotify - Apenas 100 primeiras"""
+        log.info(
+            "Buscando videos da playlist do spotify via Scraper Embed: %s ", pagina
+        )
+
+        try:
+            tries += 1
+            url = f"https://open.spotify.com/embed/playlist/{pagina}"
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            }
+
+            response = requests.get(url, headers=headers, timeout=15)
+
+            if response.status_code != 200:
+                raise Exception(f"Spotify Embed status {response.status_code}")
+
+            soup = BeautifulSoup(response.text, "html.parser")
+
+            track_rows = soup.find_all(
+                "li", class_=re.compile(r"TracklistRow_trackListRow")
+            )
+
+            if not track_rows:
+                raise Exception("No track rows found in HTML")
+
+            for row in track_rows:
+                title_tag = row.find("h3")
+                artist_tag = row.find("h4")
+
+                if title_tag and artist_tag:
+                    artist_name = artist_tag.get_text(strip=True)
+                    track_name = title_tag.get_text(strip=True)
+
+                    if artist_name and track_name:
+                        self.queue[guild_id].append(artist_name + " " + track_name)
+
+            log.info(self.queue)
+        except Exception as e:
+            log.error("Erro ao spotify playlist: %s %s", str(tries), e)
+            raise e
+
     async def spotifyplaylist(self, guild_id: int, pagina: int):
-        """Separa musicas da playlist utilizando api do youtube v3"""
+        """Separa musicas da playlist utilizando api do spotify - Premium only"""
         log.info("Buscando videos da playlist do spotify: %s ", pagina)
 
         # A conexão com o spotify as vezes reseta, implementar retry
@@ -623,7 +668,7 @@ class Music(commands.Cog):
                     self.queue[ctx.guild.id].append(url)
             else:  # É url
                 if re.search("spotify", url):
-                    await self.spotifyplaylist(ctx.guild.id, url)
+                    await self.spotifyplaylistembed(ctx.guild.id, url)
                 elif re.search("playlist", url):
                     await self.playlist(ctx.guild.id, url)
                 else:
@@ -932,7 +977,7 @@ class Music(commands.Cog):
             # Verifica se eh uma url, se nao for, completa o nome com args para pesquisa
             if await self.is_url(url):
                 if re.search("spotify", url):
-                    await self.spotifyplaylist(ctx.guild.id, url)
+                    await self.spotifyplaylistembed(ctx.guild.id, url)
                 elif re.search("playlist", url):
                     await self.playlist(ctx.guild.id, url)
                 else:
