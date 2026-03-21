@@ -284,7 +284,8 @@ class Music(commands.Cog):
         )
 
         try:
-            url = f"https://open.spotify.com/embed/playlist/{pagina}"
+            playlist_id = str(pagina).split("/")[-1].split("?")[0]
+            url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
 
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
