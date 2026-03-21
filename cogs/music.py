@@ -284,7 +284,6 @@ class Music(commands.Cog):
         )
 
         try:
-            tries += 1
             url = f"https://open.spotify.com/embed/playlist/{pagina}"
 
             headers = {
@@ -318,7 +317,7 @@ class Music(commands.Cog):
 
             log.info(self.queue)
         except Exception as e:
-            log.error("Erro ao spotify playlist: %s %s", str(tries), e)
+            log.error("Erro ao spotify playlist: %s %s", e)
             raise e
 
     async def spotifyplaylist(self, guild_id: int, pagina: int):
