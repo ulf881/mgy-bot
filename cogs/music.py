@@ -314,7 +314,11 @@ class Music(commands.Cog):
                     track_name = title_tag.get_text(strip=True)
 
                     if artist_name and track_name:
-                        self.queue[guild_id].append(artist_name + " " + track_name)
+                        self.queue[guild_id].append(
+                            artist_name.replace("\xa0", " ")
+                            + " "
+                            + track_name.replace("\xa0", " ")
+                        )
 
             log.info(self.queue)
         except Exception as e:
