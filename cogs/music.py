@@ -147,8 +147,8 @@ class YTDLSource(discord.PCMVolumeTransformer):
             )
 
         try:
-            # audio_source = discord.FFmpegPCMAudio(filename, **currentOptions)
-            audio_source = discord.FFmpegOpusAudio(filename, **currentOptions)
+            audio_source = discord.FFmpegPCMAudio(filename, **currentOptions)
+            # audio_source = discord.FFmpegOpusAudio(filename, **currentOptions)
             return cls(audio_source, data=data)
         except Exception as e:
             log.error("Erro ao criar FFmpeg Audio: %s", e)
