@@ -672,7 +672,7 @@ class Music(commands.Cog):
                     self.queue[ctx.guild.id].append(url)
             else:  # É url
                 if re.search("spotify", url):
-                    await self.spotifyplaylistembed(ctx.guild.id, url)
+                    await self.spotifyplaylist(ctx.guild.id, url)
                 elif re.search("playlist", url):
                     await self.playlist(ctx.guild.id, url)
                 else:
@@ -981,7 +981,7 @@ class Music(commands.Cog):
             # Verifica se eh uma url, se nao for, completa o nome com args para pesquisa
             if await self.is_url(url):
                 if re.search("spotify", url):
-                    await self.spotifyplaylistembed(ctx.guild.id, url)
+                    await self.spotifyplaylist(ctx.guild.id, url)
                 elif re.search("playlist", url):
                     await self.playlist(ctx.guild.id, url)
                 else:
