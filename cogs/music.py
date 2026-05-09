@@ -224,39 +224,37 @@ class Music(commands.Cog):
         """Configurações de equalizador.
         Modos: bass, normalize, earrape, ou vazio para desativar
         """
-        async with ctx.typing():
-            if not args:
-                self.equalizer_options[ctx.guild.id] = None
-                self.global_vol[ctx.guild.id] = 50 / 100
-            elif args[0] == "bass":
-                self.equalizer_options[ctx.guild.id] = (
-                    f'-filter:a "bass=g=10:f=100:w=0.8"'
-                )
-                self.global_vol[ctx.guild.id] = 50 / 100
-            elif args[0] == "normalize":
-                self.equalizer_options[ctx.guild.id] = "-filter:a loudnorm"
-                self.global_vol[ctx.guild.id] = 50 / 100
-            elif args[0] == "earrape":
-                self.equalizer_options[ctx.guild.id] = '-filter:a "volume=20" -b:a 24k'
-                self.global_vol[ctx.guild.id] = sys.float_info.max
-            else:
-                # Default also remove equalizer
-                args = None
-                self.equalizer_options[ctx.guild.id] = None
-                self.global_vol[ctx.guild.id] = 50 / 100
-            # TODO - Allow custom filter
-            if ctx.voice_client and ctx.voice_client.is_playing():
-                elapsed = time.monotonic() - self.guild_start_time[ctx.guild.id]
-                ctx.voice_client._player.source = await YTDLSource.from_url(
-                    self.queue[ctx.guild.id],
-                    f"-ss {elapsed}",
-                    self.equalizer_options.get(ctx.guild.id, ""),
-                    loop=self.bot.loop,
-                    stream=True,
-                )
-            if not args:
-                return await ctx.send("Equalizador desativado")
-            await ctx.send(f"Equalizador {args[0]} ativo")
+
+        if not args:
+            self.equalizer_options[ctx.guild.id] = None
+            self.global_vol[ctx.guild.id] = 50 / 100
+        elif args[0] == "bass":
+            self.equalizer_options[ctx.guild.id] = f'-filter:a "bass=g=10:f=100:w=0.8"'
+            self.global_vol[ctx.guild.id] = 50 / 100
+        elif args[0] == "normalize":
+            self.equalizer_options[ctx.guild.id] = "-filter:a loudnorm"
+            self.global_vol[ctx.guild.id] = 50 / 100
+        elif args[0] == "earrape":
+            self.equalizer_options[ctx.guild.id] = '-filter:a "volume=20" -b:a 24k'
+            self.global_vol[ctx.guild.id] = sys.float_info.max
+        else:
+            # Default also remove equalizer
+            args = None
+            self.equalizer_options[ctx.guild.id] = None
+            self.global_vol[ctx.guild.id] = 50 / 100
+        # TODO - Allow custom filter
+        if ctx.voice_client and ctx.voice_client.is_playing():
+            elapsed = time.monotonic() - self.guild_start_time[ctx.guild.id]
+            ctx.voice_client._player.source = await YTDLSource.from_url(
+                self.queue[ctx.guild.id],
+                f"-ss {elapsed}",
+                self.equalizer_options.get(ctx.guild.id, ""),
+                loop=self.bot.loop,
+                stream=True,
+            )
+        if not args:
+            return await ctx.send("Equalizador desativado")
+        await ctx.send(f"Equalizador {args[0]} ativo")
 
     @commands.command(hidden=True)
     async def join(self, ctx: commands.Context, *, channel: discord.VoiceChannel):
@@ -430,104 +428,104 @@ class Music(commands.Cog):
                     log.error("After executado com erro! %s", e, exc_info=1)
 
         if self.queue[ctx.guild.id]:
-            async with ctx.typing():
+
+            try:
+                player = None
+                while (
+                    player is None
+                    and self.queue
+                    and self.queue[ctx.guild.id]
+                    and len(self.queue[ctx.guild.id]) > 0
+                ):
+                    player = await YTDLSource.from_url(
+                        self.queue[ctx.guild.id],
+                        extraBeforeOptions,
+                        self.equalizer_options.get(ctx.guild.id, ""),
+                        loop=self.bot.loop,
+                        stream=True,
+                    )
+
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                log.error("Erro ao iniciar o player %s", e, exc_info=1)
+                player = None
+            if player and ctx.voice_client:
+                # Inicia a tocar
                 try:
-                    player = None
-                    while (
-                        player is None
-                        and self.queue
-                        and self.queue[ctx.guild.id]
-                        and len(self.queue[ctx.guild.id]) > 0
-                    ):
-                        player = await YTDLSource.from_url(
-                            self.queue[ctx.guild.id],
-                            extraBeforeOptions,
-                            self.equalizer_options.get(ctx.guild.id, ""),
-                            loop=self.bot.loop,
-                            stream=True,
+                    ctx.voice_client.play(player, after=nextOrCleanUp)
+                    self.guild_start_time[ctx.guild.id] = time.monotonic()
+                    # Bonus room
+                    if player.title == "Bonus Room Blitz - Donkey Kong Country":
+                        self.enableDoubleXP()
+
+                    # Cria o volume global para a guild
+                    if ctx.guild.id not in self.global_vol:
+                        self.global_vol[ctx.guild.id] = 50 / 100
+                    ctx.voice_client.source.volume = self.global_vol[ctx.guild.id]
+
+                    self.title[ctx.guild.id] = player.title
+                    log.info("Tocando %s", player.title)
+
+                    if player.duration:
+                        current_time = float(player.duration)
+                        minutes = current_time // 60
+                        current_time %= 60
+                        seconds = current_time
+                    else:
+                        current_time = 24
+                        minutes = 24
+                        seconds = current_time
+                    if len(self.queue[ctx.guild.id]) > 1:
+                        embed = discord.Embed(
+                            description="["
+                            + player.title
+                            + "]"
+                            + "("
+                            + player.data["original_url"]
+                            + ")"
+                            + (
+                                ""
+                                if await self.is_url(self.queue[ctx.guild.id][0])
+                                else "\n Pesquisado: " + self.queue[ctx.guild.id][0]
+                            )
+                            + "\n Duração: {:02d}:{:02d}\nAinda na lista: {}".format(
+                                int(minutes),
+                                int(seconds),
+                                len(self.queue[ctx.guild.id]) - 1,
+                            ),
+                            colour=0xFA00D4,
                         )
-
+                        embed.set_footer(
+                            text=switch(ctx.guild.id),
+                            icon_url="https://cdn.discordapp.com/avatars/596088044877119507/0d26138b572e7dfffc6cab54073cdb31.webp",
+                        )
+                    else:
+                        embed = discord.Embed(
+                            description="["
+                            + player.title
+                            + "]"
+                            + "("
+                            + player.data["original_url"]
+                            + ")"
+                            + (
+                                ""
+                                if await self.is_url(self.queue[ctx.guild.id][0])
+                                else "\n Pesquisado: " + self.queue[ctx.guild.id][0]
+                            )
+                            + "\n Duração: {:02d}:{:02d}".format(
+                                int(minutes), int(seconds)
+                            ),
+                            colour=0xFA00D4,
+                        )
+                        embed.set_footer(
+                            text=switch(ctx.guild.id),
+                            icon_url="https://cdn.discordapp.com/avatars/596088044877119507/0d26138b572e7dfffc6cab54073cdb31.webp",
+                        )
+                    if self.message[ctx.guild.id]:
+                        await self.message[ctx.guild.id].edit(embed=embed)
+                    else:
+                        self.message[ctx.guild.id] = await ctx.send(embed=embed)
                 except Exception as e:  # pylint: disable=broad-exception-caught
-                    log.error("Erro ao iniciar o player %s", e, exc_info=1)
-                    player = None
-                if player and ctx.voice_client:
-                    # Inicia a tocar
-                    try:
-                        ctx.voice_client.play(player, after=nextOrCleanUp)
-                        self.guild_start_time[ctx.guild.id] = time.monotonic()
-                        # Bonus room
-                        if player.title == "Bonus Room Blitz - Donkey Kong Country":
-                            self.enableDoubleXP()
-
-                        # Cria o volume global para a guild
-                        if ctx.guild.id not in self.global_vol:
-                            self.global_vol[ctx.guild.id] = 50 / 100
-                        ctx.voice_client.source.volume = self.global_vol[ctx.guild.id]
-
-                        self.title[ctx.guild.id] = player.title
-                        log.info("Tocando %s", player.title)
-
-                        if player.duration:
-                            current_time = float(player.duration)
-                            minutes = current_time // 60
-                            current_time %= 60
-                            seconds = current_time
-                        else:
-                            current_time = 24
-                            minutes = 24
-                            seconds = current_time
-                        if len(self.queue[ctx.guild.id]) > 1:
-                            embed = discord.Embed(
-                                description="["
-                                + player.title
-                                + "]"
-                                + "("
-                                + player.data["original_url"]
-                                + ")"
-                                + (
-                                    ""
-                                    if await self.is_url(self.queue[ctx.guild.id][0])
-                                    else "\n Pesquisado: " + self.queue[ctx.guild.id][0]
-                                )
-                                + "\n Duração: {:02d}:{:02d}\nAinda na lista: {}".format(
-                                    int(minutes),
-                                    int(seconds),
-                                    len(self.queue[ctx.guild.id]) - 1,
-                                ),
-                                colour=0xFA00D4,
-                            )
-                            embed.set_footer(
-                                text=switch(ctx.guild.id),
-                                icon_url="https://cdn.discordapp.com/avatars/596088044877119507/0d26138b572e7dfffc6cab54073cdb31.webp",
-                            )
-                        else:
-                            embed = discord.Embed(
-                                description="["
-                                + player.title
-                                + "]"
-                                + "("
-                                + player.data["original_url"]
-                                + ")"
-                                + (
-                                    ""
-                                    if await self.is_url(self.queue[ctx.guild.id][0])
-                                    else "\n Pesquisado: " + self.queue[ctx.guild.id][0]
-                                )
-                                + "\n Duração: {:02d}:{:02d}".format(
-                                    int(minutes), int(seconds)
-                                ),
-                                colour=0xFA00D4,
-                            )
-                            embed.set_footer(
-                                text=switch(ctx.guild.id),
-                                icon_url="https://cdn.discordapp.com/avatars/596088044877119507/0d26138b572e7dfffc6cab54073cdb31.webp",
-                            )
-                        if self.message[ctx.guild.id]:
-                            await self.message[ctx.guild.id].edit(embed=embed)
-                        else:
-                            self.message[ctx.guild.id] = await ctx.send(embed=embed)
-                    except Exception as e:  # pylint: disable=broad-exception-caught
-                        log.error("Deu ruim ao tocar! %s", e, exc_info=1)
+                    log.error("Deu ruim ao tocar! %s", e, exc_info=1)
 
     @commands.command(aliases=["vol", "v", "volmax", "maxvol", "volmilas"])
     async def volume(self, ctx: commands.Context, *args):
@@ -658,46 +656,45 @@ class Music(commands.Cog):
         """
         # (sem predownload)
 
-        async with ctx.typing():
-            # Garante que o edit esta apos ultimo comando para a guild
-            self.message[ctx.guild.id] = None
-            # Verifica se eh uma url, se nao for, completa o nome com args para pesquisa
-            if not await self.is_url(url):
-                for item in args:
-                    if not item.startswith("-"):
-                        url += " " + item
+        # Garante que o edit esta apos ultimo comando para a guild
+        self.message[ctx.guild.id] = None
+        # Verifica se eh uma url, se nao for, completa o nome com args para pesquisa
+        if not await self.is_url(url):
+            for item in args:
+                if not item.startswith("-"):
+                    url += " " + item
+            if "-f" in args:
+                self.queue[ctx.guild.id].insert(1, url)
+            else:
+                self.queue[ctx.guild.id].append(url)
+        else:  # É url
+            if re.search("spotify", url):
+                await self.spotifyplaylist(ctx.guild.id, url)
+            elif re.search("playlist", url):
+                await self.playlist(ctx.guild.id, url)
+            else:
                 if "-f" in args:
                     self.queue[ctx.guild.id].insert(1, url)
                 else:
                     self.queue[ctx.guild.id].append(url)
-            else:  # É url
-                if re.search("spotify", url):
-                    await self.spotifyplaylist(ctx.guild.id, url)
-                elif re.search("playlist", url):
-                    await self.playlist(ctx.guild.id, url)
-                else:
-                    if "-f" in args:
-                        self.queue[ctx.guild.id].insert(1, url)
-                    else:
-                        self.queue[ctx.guild.id].append(url)
 
-            # Argumentos extra
-            for item in args:
-                if item.startswith("-"):
-                    # Caso numero no fim, coloca n vezes na lista
-                    if item[1:].isdigit():
-                        log.info("Encontrado digito")
-                        for i in range(1, int(item[1:])):
-                            if i > MAX_NUM:
-                                break
-                            if "-f" in args:
-                                self.queue[ctx.guild.id].insert(1, url)
-                            else:
-                                self.queue[ctx.guild.id].append(url)
+        # Argumentos extra
+        for item in args:
+            if item.startswith("-"):
+                # Caso numero no fim, coloca n vezes na lista
+                if item[1:].isdigit():
+                    log.info("Encontrado digito")
+                    for i in range(1, int(item[1:])):
+                        if i > MAX_NUM:
+                            break
+                        if "-f" in args:
+                            self.queue[ctx.guild.id].insert(1, url)
+                        else:
+                            self.queue[ctx.guild.id].append(url)
 
-            # Se shuffle no comando, altera a ordem da lista
-            if "-shuffle" in args:
-                await self.randomizequeue(ctx)
+        # Se shuffle no comando, altera a ordem da lista
+        if "-shuffle" in args:
+            await self.randomizequeue(ctx)
 
         # Se estiver tocando, adiciona a lista
         if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
@@ -803,26 +800,26 @@ class Music(commands.Cog):
 
         log.info("Exibindo lista")
         if self.queue[ctx.guild.id]:
-            async with ctx.typing():
-                lista = "```"
-                j = 1
 
-                for x in self.queue[ctx.guild.id]:
-                    info = ytdl.extract_info(x, download=False)
-                    if info:
-                        if info.get("title"):
-                            titulo = info.get("title")
-                        else:
-                            titulo = x
+            lista = "```"
+            j = 1
+
+            for x in self.queue[ctx.guild.id]:
+                info = ytdl.extract_info(x, download=False)
+                if info:
+                    if info.get("title"):
+                        titulo = info.get("title")
                     else:
-                        titulo = r"¯\_(ツ)_/¯"
+                        titulo = x
+                else:
+                    titulo = r"¯\_(ツ)_/¯"
 
-                    lista += str(j) + ": " + titulo + "\n"
-                    j += 1
+                lista += str(j) + ": " + titulo + "\n"
+                j += 1
 
-                    # Limita exibicao para 10 musicas
-                    if j > 10:
-                        break
+                # Limita exibicao para 10 musicas
+                if j > 10:
+                    break
             lista += "Tip: Quer tocar a musica 7? Use: mgy skip 6"
             lista += "```"
             # coloca play apos a lista
@@ -1038,115 +1035,115 @@ class Music(commands.Cog):
         Exemplo: mgy add garagem link. Em seguida utilize: mgy t garagem"""
 
         # Consulta para buscar informacoes do usuario que enviou a mensagem
-        async with ctx.typing():
-            if len(name) > 20:
-                return await ctx.send("Nome muito longo, use até 20 caracteres")
-            sql = "select * from MUSIC_LINKS"
-            sql += " WHERE NAME = '" + str(name) + "'"
 
-            log.info("Buscando musica: %s", str(name))
-            resultado = self.pg.query(sql)
+        if len(name) > 20:
+            return await ctx.send("Nome muito longo, use até 20 caracteres")
+        sql = "select * from MUSIC_LINKS"
+        sql += " WHERE NAME = '" + str(name) + "'"
 
-            # Musica encontrada
-            if resultado:
-                ctx.send(
-                    "Nome já existe. Você pode verificar os links existentes com: mgy musiclinks"
-                )
+        log.info("Buscando musica: %s", str(name))
+        resultado = self.pg.query(sql)
 
-            # Musica nao encontrada
+        # Musica encontrada
+        if resultado:
+            ctx.send(
+                "Nome já existe. Você pode verificar os links existentes com: mgy musiclinks"
+            )
+
+        # Musica nao encontrada
+        else:
+            # Verifica se eh uma url, se nao for, completa o nome com args para pesquisa
+            if not await self.is_url(url):
+                await ctx.send("Url invalida")
+                return
             else:
-                # Verifica se eh uma url, se nao for, completa o nome com args para pesquisa
-                if not await self.is_url(url):
-                    await ctx.send("Url invalida")
-                    return
-                else:
-                    sql = "select ID_USUARIOS from USUARIOS"
-                    sql += " WHERE USER_ID_DISCORD = '" + str(ctx.author.id) + "'"
+                sql = "select ID_USUARIOS from USUARIOS"
+                sql += " WHERE USER_ID_DISCORD = '" + str(ctx.author.id) + "'"
 
-                    log.info("Buscando musica: %s", str(name))
-                    resultado = self.pg.query(sql)
-                    if resultado:
-                        info = ytdl.extract_info(url, download=False)
-                        titulo = " "
-                        if info:
-                            if info.get("title"):
-                                titulo = info.get("title")
+                log.info("Buscando musica: %s", str(name))
+                resultado = self.pg.query(sql)
+                if resultado:
+                    info = ytdl.extract_info(url, download=False)
+                    titulo = " "
+                    if info:
+                        if info.get("title"):
+                            titulo = info.get("title")
 
-                        sql = "insert into MUSIC_LINKS (NAME, URL, USER_ID, TITLE)"
-                        sql += (
-                            " values ('"
+                    sql = "insert into MUSIC_LINKS (NAME, URL, USER_ID, TITLE)"
+                    sql += (
+                        " values ('"
+                        + str(name)
+                        + "', '"
+                        + str(url)
+                        + "', '"
+                        + str(resultado[0]["id_usuarios"])
+                        + "', '"
+                        + str(titulo)
+                        + "')"
+                    )
+                    try:
+                        self.pg.update(sql)
+                        await ctx.send(
+                            "Adicionado "
                             + str(name)
-                            + "', '"
-                            + str(url)
-                            + "', '"
-                            + str(resultado[0]["id_usuarios"])
-                            + "', '"
-                            + str(titulo)
-                            + "')"
+                            + ". Para tocar use: mgy t "
+                            + str(name)
                         )
-                        try:
-                            self.pg.update(sql)
-                            await ctx.send(
-                                "Adicionado "
-                                + str(name)
-                                + ". Para tocar use: mgy t "
-                                + str(name)
-                            )
-                        except Exception as e:  # pylint: disable=broad-exception-caught
-                            log.error("Erro ao adicionar link, %s", e, exc_info=1)
+                    except Exception as e:  # pylint: disable=broad-exception-caught
+                        log.error("Erro ao adicionar link, %s", e, exc_info=1)
 
     @commands.command(aliases=["mlist", "mlinks", "links"])
     async def musiclinks(self, ctx: commands.Context):
         """Mostra os comandos de musica criados"""
         # https://cog-creators.github.io/discord-embed-sandbox/
-        async with ctx.typing():
-            sql = "select * from MUSIC_LINKS"
-            resultado = self.pg.query(sql)
-            if resultado:
-                lista = []
-                titulo = []
 
-                for x in resultado:
-                    lista.append(
-                        "[" + str(x["name"]) + "]" + "(" + str(x["url"]) + ")" + "\n"
-                    )
-                    if x["title"]:
-                        titulo.append(str(x["title"]) + "\n")
-                    else:
-                        titulo.append("Não encontrado \n")
-                i = 0
-                name = ""
-                title = ""
-                while i < len(lista):
-                    name += lista[i]
-                    title += titulo[i]
-                    if i != 0 and i % 10 == 0:
-                        embed = discord.Embed(colour=0xFA00D4)
+        sql = "select * from MUSIC_LINKS"
+        resultado = self.pg.query(sql)
+        if resultado:
+            lista = []
+            titulo = []
 
-                        embed.add_field(name="Nome", value=name, inline=True)
-                        embed.add_field(
-                            name="Titulo",
-                            value=title,
-                            inline=True,
-                        )
-                        await ctx.send(embed=embed)
-
-                        title = ""
-                        name = ""
-                    i += 1
-
-                embed = discord.Embed(colour=0xFA00D4)
-
-                if name != "":
-                    embed.add_field(name="Nome", value=name, inline=True)
-                    embed.add_field(name="Titulo", value=title, inline=True)
-
-                embed.set_footer(
-                    text="Para tocar use: mgy t nome. Com nome sendo um dos mostrados acima, use -shuffle para shuffle",
-                    icon_url="https://cdn.discordapp.com/avatars/596088044877119507/0d26138b572e7dfffc6cab54073cdb31.webp",
+            for x in resultado:
+                lista.append(
+                    "[" + str(x["name"]) + "]" + "(" + str(x["url"]) + ")" + "\n"
                 )
+                if x["title"]:
+                    titulo.append(str(x["title"]) + "\n")
+                else:
+                    titulo.append("Não encontrado \n")
+            i = 0
+            name = ""
+            title = ""
+            while i < len(lista):
+                name += lista[i]
+                title += titulo[i]
+                if i != 0 and i % 10 == 0:
+                    embed = discord.Embed(colour=0xFA00D4)
 
-                await ctx.send(embed=embed)
+                    embed.add_field(name="Nome", value=name, inline=True)
+                    embed.add_field(
+                        name="Titulo",
+                        value=title,
+                        inline=True,
+                    )
+                    await ctx.send(embed=embed)
+
+                    title = ""
+                    name = ""
+                i += 1
+
+            embed = discord.Embed(colour=0xFA00D4)
+
+            if name != "":
+                embed.add_field(name="Nome", value=name, inline=True)
+                embed.add_field(name="Titulo", value=title, inline=True)
+
+            embed.set_footer(
+                text="Para tocar use: mgy t nome. Com nome sendo um dos mostrados acima, use -shuffle para shuffle",
+                icon_url="https://cdn.discordapp.com/avatars/596088044877119507/0d26138b572e7dfffc6cab54073cdb31.webp",
+            )
+
+            await ctx.send(embed=embed)
 
     @play.before_invoke
     @mashups.before_invoke
