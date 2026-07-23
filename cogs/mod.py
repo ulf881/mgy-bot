@@ -4,6 +4,7 @@ Modulo para games. AKA CrappyDungeon
 
 import logging
 import os
+from pathlib import Path
 from random import randint
 import re
 import sys
@@ -272,6 +273,24 @@ class Mod(commands.Cog, name="Mod"):
         await ctx.send(
             "Colabore com o desenvolvimento do bot: https://github.com/ulf881/mgy-bot"
         )
+
+    @commands.command(hidden=True)
+    @commands.has_role("Staff")
+    async def cookies(self, ctx: commands.Context, *, cookies: str):
+        """Atualiza os cookies para uso dos comandos de música. Abra e faça login em uma aba anônima ou uma conta que não utiliza para durar mais tempo"""
+        # project root
+        ROOT = Path(__file__).resolve().parent.parent
+        COOKIES_FILE = ROOT / "cookies.txt"
+        try:
+            with open(COOKIES_FILE, "w", encoding="utf-8") as f:
+                f.write(cookies)
+
+            await ctx.message.delete()
+            await ctx.send("✅ cookies.txt atualizados")
+            await self.restart(ctx)
+
+        except Exception as e:
+            await ctx.send(f"❌ Erro ao atualizar cookies:\n`{e}`")
 
     @commands.command(aliases=["dice", "dado", "rand", "rolar"])
     async def roll(self, ctx: commands.Context, dice: str):
