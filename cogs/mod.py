@@ -276,14 +276,21 @@ class Mod(commands.Cog, name="Mod"):
 
     @commands.command(hidden=True)
     @commands.has_role("Staff")
-    async def cookies(self, ctx: commands.Context, *, cookies: str):
+    async def cookies(self, ctx: commands.Context):
         """Atualiza os cookies para uso dos comandos de música. Abra e faça login em uma aba anônima ou uma conta que não utiliza para durar mais tempo"""
         # project root
         ROOT = Path(__file__).resolve().parent.parent
         COOKIES_FILE = ROOT / "cookies.txt"
         try:
-            with open(COOKIES_FILE, "w", encoding="utf-8") as f:
-                f.write(cookies)
+            if not ctx.message.attachments:
+                return await ctx.send(
+                    "Inclua o arquivo com os cookies.", delete_after=5
+                )
+
+            attachment = ctx.message.attachments[0]
+
+            # Save it as cookies.txt regardless of the uploaded filename
+            await attachment.save(COOKIES_FILE)
 
             await ctx.message.delete()
             await ctx.send("✅ cookies.txt atualizados")
