@@ -33,11 +33,11 @@ log = logging.getLogger("music")
 # yt_dlp.utils.bug_reports_message = lambda: ""
 
 ytdl_format_options = {
-    "format": "bestaudio/best",
+    "format": "bestaudio[ext=webm]/bestaudio/best",
     "outtmpl": "%(extractor)s-%(id)s-%(title)s.%(ext)s",
     "restrictfilenames": True,
     "noplaylist": True,
-    "playlistrandom": True,
+    # "playlistrandom": True,
     "nocheckcertificate": True,
     "ignoreerrors": True,
     "logtostderr": False,
@@ -46,8 +46,11 @@ ytdl_format_options = {
     "default_search": "auto",
     # bind to ipv4 since ipv6 addresses cause issues sometimes
     "source_address": "0.0.0.0",
-    "verbose": False,
+    "verbose": True,
     "cookiefile": "cookies.txt",
+    "extractor_args": {
+        "youtube": {"player_client": ["web_embedded", "web", "tv"]}
+    },  # android?
 }
 
 ffmpeg_options = {
@@ -104,23 +107,24 @@ class YTDLSource(discord.PCMVolumeTransformer):
         """Retira informações da URL e lida com a fila."""
         loop = loop or asyncio.get_event_loop()
         data = None
+        ydl = None
 
         while queue:
             try:
-                current_url = queue[0]
+                current_url = queue.pop(0)
 
-                data = await loop.run_in_executor(
-                    None, lambda: ytdl.extract_info(current_url, download=not stream)
-                )
+                def extract():
+                    nonlocal ydl
+                    ydl = yt_dlp.YoutubeDL(ytdl_format_options)
+                    return ydl.extract_info(current_url, download=not stream)
+
+                data = await loop.run_in_executor(None, extract)
 
                 if data and "entries" in data:
                     data = data["entries"][0]
-
                 if data:
                     break
-                queue.pop(0)
             except Exception as e:
-                queue.pop(0)
                 log.error("Erro ao adquirir vídeo da URL '%s': %s", current_url, e)
 
             await asyncio.sleep(2)  # small delay before next try
@@ -130,7 +134,18 @@ class YTDLSource(discord.PCMVolumeTransformer):
             return None
 
         try:
-            filename = data["url"] if stream else ytdl.prepare_filename(data)
+            if stream:
+                filename = data["url"]
+
+                # Debug para verificar o que yt-dlp entregou
+                log.info("\n===== YT-DLP DEBUG =====")
+                log.info("URL:", filename)
+                log.info("Headers:", data.get("http_headers"))
+                log.info("========================\n")
+
+            else:
+                filename = ytdl.prepare_filename(data)
+
         except Exception as e:
             log.error("Erro ao preparar filename: %s", e)
             return None
@@ -138,21 +153,40 @@ class YTDLSource(discord.PCMVolumeTransformer):
         # Escolhe opções de FFmpeg com base no equalizador e skip
         currentOptions = (ffmpeg_options).copy()
         if extraBeforeOptions:
-            currentOptions["before_options"] = (
-                f"{currentOptions.get('before_options', '')} {extraBeforeOptions}"
-            )
+            before += f" {extraBeforeOptions}"
+
+        if stream and data.get("http_headers"):
+            headers = data["http_headers"]
+            header_strings = []
+
+            if "User-Agent" in headers:
+                header_strings.append(f'User-Agent: {headers["User-Agent"]}')
+            if "Referer" in headers:
+                header_strings.append(f'Referer: {headers["Referer"]}')
+            if "Cookie" in headers:
+                header_strings.append(f'Cookie: {headers["Cookie"]}')
+
+            if header_strings:
+                combined_headers = "\r\n".join(header_strings) + "\r\n"
+                before += f' -headers "{combined_headers}"'
+
+        currentOptions["before_options"] = before
+
         if extraOptions:
             currentOptions["options"] = (
                 f"{currentOptions.get('options', '')} {extraOptions}"
             )
+        for attempt in range(3):
+            try:
+                audio_source = discord.FFmpegPCMAudio(filename, **currentOptions)
+                # audio_source = discord.FFmpegOpusAudio(filename, **currentOptions)
+                return cls(audio_source, data=data)
 
-        try:
-            audio_source = discord.FFmpegPCMAudio(filename, **currentOptions)
-            # audio_source = discord.FFmpegOpusAudio(filename, **currentOptions)
-            return cls(audio_source, data=data)
-        except Exception as e:
-            log.error("Erro ao criar FFmpeg Audio: %s", e)
-            return None
+            except Exception as e:
+                log.error("Erro ao criar FFmpeg Audio: %s", e)
+                if attempt == 2:
+                    return None
+                await asyncio.sleep(1)
 
 
 class Music(commands.Cog):
