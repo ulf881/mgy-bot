@@ -109,6 +109,18 @@ class YTDLSource(discord.PCMVolumeTransformer):
         data = None
         ydl = None
 
+        # Escolhe opções de FFmpeg com base no equalizador e skip
+        currentOptions = (ffmpeg_options).copy()
+        if extraBeforeOptions:
+            before += f" {extraBeforeOptions}"
+
+        currentOptions["before_options"] = before
+
+        if extraOptions:
+            currentOptions["options"] = (
+                f"{currentOptions.get('options', '')} {extraOptions}"
+            )
+
         while queue:
             try:
                 current_url = queue.pop(0)
@@ -150,11 +162,6 @@ class YTDLSource(discord.PCMVolumeTransformer):
             log.error("Erro ao preparar filename: %s", e)
             return None
 
-        # Escolhe opções de FFmpeg com base no equalizador e skip
-        currentOptions = (ffmpeg_options).copy()
-        if extraBeforeOptions:
-            before += f" {extraBeforeOptions}"
-
         if stream and data.get("http_headers"):
             headers = data["http_headers"]
             header_strings = []
@@ -170,23 +177,14 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 combined_headers = "\r\n".join(header_strings) + "\r\n"
                 before += f' -headers "{combined_headers}"'
 
-        currentOptions["before_options"] = before
+        try:
+            audio_source = discord.FFmpegPCMAudio(filename, **currentOptions)
+            # audio_source = discord.FFmpegOpusAudio(filename, **currentOptions)
+            return cls(audio_source, data=data)
 
-        if extraOptions:
-            currentOptions["options"] = (
-                f"{currentOptions.get('options', '')} {extraOptions}"
-            )
-        for attempt in range(3):
-            try:
-                audio_source = discord.FFmpegPCMAudio(filename, **currentOptions)
-                # audio_source = discord.FFmpegOpusAudio(filename, **currentOptions)
-                return cls(audio_source, data=data)
-
-            except Exception as e:
-                log.error("Erro ao criar FFmpeg Audio: %s", e)
-                if attempt == 2:
-                    return None
-                await asyncio.sleep(1)
+        except Exception as e:
+            log.error("Erro ao criar FFmpeg Audio: %s", e)
+            await asyncio.sleep(1)
 
 
 class Music(commands.Cog):
