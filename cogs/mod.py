@@ -10,6 +10,7 @@ import re
 import sys
 import subprocess
 
+import aiohttp
 import discord
 from discord import ChannelType
 from discord.ext import commands
@@ -289,6 +290,9 @@ class Mod(commands.Cog, name="Mod"):
 
             attachment = ctx.message.attachments[0]
 
+            if COOKIES_FILE.exists():
+                COOKIES_FILE.unlink()
+
             # Save it as cookies.txt regardless of the uploaded filename
             await attachment.save(COOKIES_FILE)
 
@@ -318,6 +322,151 @@ class Mod(commands.Cog, name="Mod"):
 
         for i in range(first_number):
             await ctx.send(print(randint(1, second_number)))
+
+    @commands.command(hidden=True)
+    async def instagram(self, ctx: commands.Context, url: str):
+        """
+        Gera um embedding para links do Instagram que não funcionam nativamente no Discord.
+        O bot tentará várias alternativas de domínio até encontrar uma que funcione.
+
+        Args:
+            url (str): O link original do Instagram (ex: https://www.instagram.com/p/XXXXXXXXXXX/).
+        """
+        # Deferir a resposta para que o usuário saiba que o bot está processando o comando,
+        # especialmente útil para operações que podem levar alguns segundos.
+        await ctx.defer()
+
+        alternative_domains = [
+            "ddinstagram.com",
+            "v.ddinstagram.com",  # Uma variante comum para ddinstagram
+            "vxinstagram.com",
+            "kgram.to",
+            "instafix.net",
+            # Adicione mais alternativas aqui à medida que se tornarem disponíveis
+            # ou se as atuais pararem de funcionar.
+        ]
+        # Expressão regular para verificar se o URL contém um domínio do Instagram.
+        # É flexível o suficiente para identificar posts, reels, etc., para substituição de domínio.
+        instagram_domain_pattern = re.compile(r"(instagram\.com|instagr\.am)")
+
+        # 1. Validar o URL de entrada para garantir que ele contenha um domínio do Instagram.
+        original_domain_match = instagram_domain_pattern.search(url)
+        if not original_domain_match:
+            await ctx.reply(
+                "Por favor, forneça um link válido do Instagram (deve conter `instagram.com` ou `instagr.am`)."
+            )
+            return
+
+        original_domain = original_domain_match.group(0)
+
+        found_working_embed = False
+        # Itera sobre os domínios alternativos definidos.
+        for alt_domain in alternative_domains:
+            # Constrói o URL transformado, substituindo o domínio original do Instagram.
+            transformed_url = url.replace(original_domain, alt_domain)
+
+            try:
+                # Usa aiohttp para fazer uma requisição HEAD. Isso é eficiente, pois
+                # só busca os cabeçalhos (headers), não o conteúdo completo, para
+                # verificar a acessibilidade do link.
+                # `allow_redirects=True` garante que sigamos quaisquer redirecionamentos
+                # que o serviço alternativo possa usar.
+                # `timeout` evita que o bot fique aguardando indefinidamente.
+                async with aiohttp.ClientSession() as session:
+                    async with session.head(
+                        transformed_url, allow_redirects=True, timeout=10
+                    ) as response:
+                        # Se o status da resposta for 200 OK, consideramos este um link
+                        # potencialmente incorporável, pois o serviço alternativo está acessível.
+                        if response.status == 200:
+                            # Envia apenas o link transformado para que o Discord tente incorporá-lo.
+                            await ctx.send(transformed_url)
+                            found_working_embed = True
+                            break  # Para após a primeira tentativa bem-sucedida
+                        # Não há necessidade de enviar uma mensagem se uma alternativa falhou com um status diferente de 200,
+                        # pois o usuário não quer ver o processo.
+            except aiohttp.ClientError:
+                # Captura erros específicos do cliente aiohttp (por exemplo, problemas de DNS, conexão recusada).
+                # Não envia mensagem ao usuário sobre a falha.
+                pass
+            except Exception:
+                # Captura quaisquer outros erros inesperados durante o processo.
+                # Não envia mensagem ao usuário sobre a falha.
+                pass
+
+        # Se nenhum link incorporável foi encontrado após tentar todas as alternativas.
+        if not found_working_embed:
+            await ctx.send(
+                "Não foi possível encontrar uma alternativa de embed funcional para o seu link do Instagram. "
+                "As alternativas podem mudar com o tempo ou o link pode ser privado/inexistente."
+            )
+
+    @commands.command(hidden=True)
+    async def twitter(self, ctx: commands.Context, url: str):
+        """
+        Gera um embedding para links do Twitter/X que não funcionam nativamente no Discord.
+        O bot tentará usar fxtwitter.com como serviço alternativo.
+
+        Args:
+            url (str): O link original do Twitter/X (ex: https://twitter.com/user/status/XXXXXXXXXXX ou https://x.com/user/status/XXXXXXXXXXX).
+        """
+        # Deferir a resposta para que o usuário saiba que o bot está processando o comando.
+        await ctx.defer()
+
+        # Domínio alternativo principal para Twitter/X.
+        # fxtwitter.com é um serviço popular para melhorar embeds de tweets no Discord.
+        alternative_domain = "fxtwitter.com"
+
+        # Expressão regular para verificar se o URL contém um domínio do Twitter/X.
+        # Captura tanto 'twitter.com' quanto 'x.com'.
+        twitter_domain_pattern = re.compile(r"(twitter\.com|x\.com)")
+
+        # 1. Validar o URL de entrada para garantir que ele contenha um domínio do Twitter/X.
+        original_domain_match = twitter_domain_pattern.search(url)
+        if not original_domain_match:
+            await ctx.reply(
+                "Por favor, forneça um link válido do Twitter/X (deve conter `twitter.com` ou `x.com`)."
+            )
+            return
+
+        original_domain = original_domain_match.group(0)
+
+        # Constrói o URL transformado, substituindo o domínio original.
+        # Garante que o protocolo (http/https) seja mantido.
+        # Se o link original já tiver um subdomínio como 'pbs.twimg.com' para mídias,
+        # isso não será tratado, focando apenas nos links de status/postagens.
+        transformed_url = url.replace(original_domain, alternative_domain)
+
+        try:
+            # Usa aiohttp para fazer uma requisição HEAD.
+            # `allow_redirects=True` para seguir redirecionamentos.
+            # `timeout` para evitar esperas longas.
+            async with aiohttp.ClientSession() as session:
+                async with session.head(
+                    transformed_url, allow_redirects=True, timeout=10
+                ) as response:
+                    # Se o status da resposta for 200 OK, considera que o embed pode funcionar.
+                    if response.status == 200:
+                        # Envia apenas o link transformado para que o Discord tente incorporá-lo.
+                        await ctx.send(transformed_url)
+                    else:
+                        # Se fxtwitter.com não retornar 200 OK, informa o usuário.
+                        await ctx.send(
+                            f"Não foi possível gerar um embed usando `{alternative_domain}` para o link fornecido. "
+                            f"Status HTTP: `{response.status}`. "
+                            "O link pode ser privado, inexistente ou o serviço fxtwitter.com pode estar com problemas."
+                        )
+        except aiohttp.ClientError:
+            # Captura erros de conexão (DNS, conexão recusada, etc.).
+            await ctx.send(
+                "Ocorreu um erro de conexão ao tentar gerar o embed para o seu link do Twitter/X. "
+                "Verifique o link ou tente novamente mais tarde."
+            )
+        except Exception as e:
+            # Captura quaisquer outros erros inesperados.
+            await ctx.send(
+                f"Ocorreu um erro inesperado: `{e}` ao tentar gerar o embed para o seu link do Twitter/X."
+            )
 
 
 async def setup(bot: commands.Bot):
