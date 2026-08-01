@@ -33,45 +33,6 @@ COOKIES_FILE = os.path.abspath(
 IF_NOT_EXISTS = os.path.exists(COOKIES_FILE)
 
 
-def _normalize_cookie_file(path: str) -> str:
-    """Return a temp Netscape cookie file with tab separators so yt-dlp can parse it."""
-    if not os.path.exists(path):
-        return path
-
-    temp_path = None
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as source:
-            normalized_lines = []
-            for raw_line in source:
-                line = raw_line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                tokens = line.split()
-                if len(tokens) < 7:
-                    continue
-                domain = tokens[0]
-                flag = tokens[1]
-                cookie_path = tokens[2]
-                secure = tokens[3]
-                expires = tokens[4]
-                name = tokens[5]
-                value = " ".join(tokens[6:])
-                normalized_lines.append(
-                    "\t".join([domain, flag, cookie_path, secure, expires, name, value])
-                    + "\n"
-                )
-
-        if not normalized_lines:
-            return path
-
-        temp_fd, temp_path = tempfile.mkstemp(prefix="mgy_cookies_", suffix=".txt")
-        with os.fdopen(temp_fd, "w", encoding="utf-8", newline="") as handle:
-            handle.writelines(normalized_lines)
-        return temp_path
-    except OSError:
-        return path
-
-
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
     "Accept": "*/*",
@@ -85,8 +46,6 @@ log = logging.getLogger("music")
 
 # Suppress noise about console usage from errors
 # yt_dlp.utils.bug_reports_message = lambda: ""
-
-NORMALIZED_COOKIES_FILE = _normalize_cookie_file(COOKIES_FILE)
 
 ytdl_format_options = {
     "format": "bestaudio[ext=webm]/bestaudio/best",
@@ -103,7 +62,7 @@ ytdl_format_options = {
     # bind to ipv4 since ipv6 addresses cause issues sometimes
     "source_address": "0.0.0.0",
     "verbose": True,
-    "cookiefile": NORMALIZED_COOKIES_FILE,
+    "cookiefile": COOKIES_FILE,
     "http_headers": BROWSER_HEADERS,
     "extractor_args": {
         "youtube": {"player_client": ["web_embedded", "web", "tv"]}
