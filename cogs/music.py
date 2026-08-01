@@ -160,7 +160,8 @@ class YTDLSource(discord.PCMVolumeTransformer):
             log.error("Erro ao preparar filename: %s", e)
             return None
 
-        if stream and data.get("http_headers"):
+        if data.get("http_headers"):
+            log.info("Headers:", data.get("http_headers"))
             headers = data["http_headers"]
             header_strings = []
 
