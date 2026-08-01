@@ -102,13 +102,12 @@ def _extract_cookie_header(path: str) -> str:
                 if not line or line.startswith("#"):
                     continue
 
-                parts = line.split()
-                if len(parts) < 7:
+                fields = re.split(r"\s+", line)
+                if len(fields) < 7:
                     continue
 
-                domain = parts[0]
-                name = parts[5]
-                value = " ".join(parts[6:])
+                domain, _, _, _, _, name, *rest = fields
+                value = " ".join(rest) if rest else ""
                 if not name or not value:
                     continue
 
@@ -239,7 +238,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
         while queue:
             try:
-                current_url = queue.pop(0)
+                current_url = queue[0]
 
                 def extract():
                     return ydl.extract_info(current_url, download=not stream)
@@ -250,8 +249,10 @@ class YTDLSource(discord.PCMVolumeTransformer):
                     data = data["entries"][0]
                 if data:
                     break
+                current_url = queue.pop(0)
             except Exception as e:
                 log.error("Erro ao adquirir vídeo da URL '%s': %s", current_url, e)
+                current_url = queue.pop(0)
 
             await asyncio.sleep(2)  # small delay before next try
         else:
