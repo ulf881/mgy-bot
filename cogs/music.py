@@ -20,11 +20,17 @@ from discord.ext import tasks, commands
 import googleapiclient.discovery
 from bs4 import BeautifulSoup
 import time
+import tempfile
 
 
 from utils.pgdatabase import Postgres
 
 MAX_NUM = 100000
+
+COOKIES_FILE = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "cookies.txt")
+)
+IF_NOT_EXISTS = os.path.exists(COOKIES_FILE)
 
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
@@ -55,7 +61,8 @@ ytdl_format_options = {
     # bind to ipv4 since ipv6 addresses cause issues sometimes
     "source_address": "0.0.0.0",
     "verbose": True,
-    "cookiefile": "cookies.txt",
+    "cookiefile": COOKIES_FILE,
+    "http_headers": BROWSER_HEADERS,
     "extractor_args": {
         "youtube": {"player_client": ["web_embedded", "web", "tv"]}
     },  # android?
@@ -79,6 +86,56 @@ youtube = googleapiclient.discovery.build(
     developerKey=os.environ["YOUTUBE_API_KEY"],
     cache_discovery=False,
 )
+
+
+def _extract_cookie_header(path: str) -> str:
+    """Read the Netscape cookies file and return the YouTube/Google Cookie header."""
+    if not os.path.exists(path):
+        return ""
+
+    cookie_pairs = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 7:
+                    continue
+                domain, _, _, _, _, name, value = parts[:7]
+                if domain in {
+                    ".youtube.com",
+                    "youtube.com",
+                    ".google.com",
+                    "google.com",
+                }:
+                    cookie_pairs.append(f"{name}={value}")
+    except OSError:
+        return ""
+
+    seen = set()
+    ordered = []
+    for cookie in cookie_pairs:
+        if cookie not in seen:
+            seen.add(cookie)
+            ordered.append(cookie)
+    return "; ".join(ordered)
+
+
+def _build_ffmpeg_headers(data: dict):
+    """Build a browser-like header set for GoogleVideo stream URLs."""
+    headers = dict(BROWSER_HEADERS)
+    yt_headers = data.get("http_headers") or {}
+    headers.update({k: v for k, v in yt_headers.items() if v})
+
+    if not headers.get("Referer") and data.get("webpage_url"):
+        headers["Referer"] = data["webpage_url"]
+
+    cookie_value = _extract_cookie_header(COOKIES_FILE)
+    if cookie_value:
+        headers["Cookie"] = cookie_value
+    return headers
 
 
 def switch(guild_id: int):
@@ -170,48 +227,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
             log.error("Erro ao preparar filename: %s", e)
             return None
 
-        # Fallback robusto: `http_headers` nem sempre vem no info dict do stream final.
-        # Quando isso acontece, FFmpeg recebe o stream URL sem o User-Agent/Referer/Cookie
-        # que o GoogleVideo exige, então 403 acontece mesmo com cookies válidos.
-        headers = dict(BROWSER_HEADERS)
-        yt_headers = data.get("http_headers") or {}
-        headers.update({k: v for k, v in yt_headers.items() if v})
-
-        if not headers.get("Referer") and data.get("webpage_url"):
-            headers["Referer"] = data["webpage_url"]
-
-        cookie_file = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "cookies.txt")
-        )
-        if os.path.exists(cookie_file):
-            try:
-                cookie_parts = []
-                with open(cookie_file, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or line.startswith("#"):
-                            continue
-                        cols = line.split("\t")
-                        if len(cols) >= 7:
-                            domain, _, _, _, _, name, value = cols[:7]
-                            if domain in {
-                                ".youtube.com",
-                                "youtube.com",
-                                ".google.com",
-                                "google.com",
-                            }:
-                                cookie_parts.append(f"{name}={value}")
-                if cookie_parts:
-                    seen = set()
-                    unique = []
-                    for cookie in cookie_parts:
-                        if cookie not in seen:
-                            seen.add(cookie)
-                            unique.append(cookie)
-                    headers["Cookie"] = "; ".join(unique)
-            except OSError:
-                pass
-
+        headers = _build_ffmpeg_headers(data)
         header_strings = [f"{key}: {value}" for key, value in headers.items() if value]
         if header_strings:
             combined_headers = "\r\n".join(header_strings) + "\r\n"
@@ -221,10 +237,57 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
         try:
             audio_source = discord.FFmpegPCMAudio(filename, **currentOptions)
-            # audio_source = discord.FFmpegOpusAudio(filename, **currentOptions)
             return cls(audio_source, data=data)
 
         except Exception as e:
+            error_text = str(e).lower()
+            if stream and ("403" in error_text or "forbidden" in error_text):
+                log.warning(
+                    "GoogleVideo stream rejected with 403; trying temporary fallback for %s",
+                    current_url,
+                )
+                try:
+                    temp_dir = tempfile.mkdtemp(prefix="mgy_music_")
+                    fallback_opts = dict(ytdl_format_options)
+                    fallback_opts.update(
+                        {
+                            "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
+                            "quiet": True,
+                            "no_warnings": True,
+                            "noplaylist": True,
+                        }
+                    )
+                    with yt_dlp.YoutubeDL(fallback_opts) as fallback_ytdl:
+                        fallback_ytdl.download([current_url])
+                        fallback_file = os.path.join(
+                            temp_dir, f"{data.get('title', 'fallback')}.webm"
+                        )
+                        if not os.path.exists(fallback_file):
+                            fallback_file = os.path.join(
+                                temp_dir,
+                                next(
+                                    (
+                                        x
+                                        for x in os.listdir(temp_dir)
+                                        if x.lower().endswith(
+                                            (".webm", ".m4a", ".mp3", ".mp4")
+                                        )
+                                    ),
+                                    "fallback.webm",
+                                ),
+                            )
+                        if os.path.exists(fallback_file):
+                            fallback_source = discord.FFmpegPCMAudio(
+                                fallback_file, **currentOptions
+                            )
+                            return cls(fallback_source, data=data)
+                except Exception as fallback_error:
+                    log.error(
+                        "Fallback local temp stream failed for %s: %s",
+                        current_url,
+                        fallback_error,
+                        exc_info=True,
+                    )
             log.error("Erro ao criar FFmpeg Audio: %s", e)
             await asyncio.sleep(1)
 
