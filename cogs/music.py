@@ -26,6 +26,14 @@ from utils.pgdatabase import Postgres
 
 MAX_NUM = 100000
 
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.youtube.com/",
+    "Origin": "https://www.youtube.com",
+}
+
 # Inicia o logger
 log = logging.getLogger("music")
 
@@ -151,8 +159,8 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
                 # Debug para verificar o que yt-dlp entregou
                 log.info("\n===== YT-DLP DEBUG =====")
-                log.info("URL:", filename)
-                log.info("Headers:", data.get("http_headers"))
+                log.info("URL: %s", filename)
+                log.info("Headers: %s", data.get("http_headers"))
                 log.info("========================\n")
 
             else:
@@ -162,23 +170,54 @@ class YTDLSource(discord.PCMVolumeTransformer):
             log.error("Erro ao preparar filename: %s", e)
             return None
 
-        if data.get("http_headers"):
-            log.info("Headers:", data.get("http_headers"))
-            headers = data["http_headers"]
-            header_strings = []
+        # Fallback robusto: `http_headers` nem sempre vem no info dict do stream final.
+        # Quando isso acontece, FFmpeg recebe o stream URL sem o User-Agent/Referer/Cookie
+        # que o GoogleVideo exige, então 403 acontece mesmo com cookies válidos.
+        headers = dict(BROWSER_HEADERS)
+        yt_headers = data.get("http_headers") or {}
+        headers.update({k: v for k, v in yt_headers.items() if v})
 
-            if "User-Agent" in headers:
-                header_strings.append(f'User-Agent: {headers["User-Agent"]}')
-            if "Referer" in headers:
-                header_strings.append(f'Referer: {headers["Referer"]}')
-            if "Cookie" in headers:
-                header_strings.append(f'Cookie: {headers["Cookie"]}')
+        if not headers.get("Referer") and data.get("webpage_url"):
+            headers["Referer"] = data["webpage_url"]
 
-            if header_strings:
-                combined_headers = "\r\n".join(header_strings) + "\r\n"
-                before = currentOptions.get("before_options", "")
-                before = f'{before} -headers "{combined_headers}"'.strip()
-                currentOptions["before_options"] = before
+        cookie_file = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "cookies.txt")
+        )
+        if os.path.exists(cookie_file):
+            try:
+                cookie_parts = []
+                with open(cookie_file, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        cols = line.split("\t")
+                        if len(cols) >= 7:
+                            domain, _, _, _, _, name, value = cols[:7]
+                            if domain in {
+                                ".youtube.com",
+                                "youtube.com",
+                                ".google.com",
+                                "google.com",
+                            }:
+                                cookie_parts.append(f"{name}={value}")
+                if cookie_parts:
+                    seen = set()
+                    unique = []
+                    for cookie in cookie_parts:
+                        if cookie not in seen:
+                            seen.add(cookie)
+                            unique.append(cookie)
+                    headers["Cookie"] = "; ".join(unique)
+            except OSError:
+                pass
+
+        header_strings = [f"{key}: {value}" for key, value in headers.items() if value]
+        if header_strings:
+            combined_headers = "\r\n".join(header_strings) + "\r\n"
+            before = currentOptions.get("before_options", "")
+            before = f'{before} -headers "{combined_headers}"'.strip()
+            currentOptions["before_options"] = before
 
         try:
             audio_source = discord.FFmpegPCMAudio(filename, **currentOptions)
