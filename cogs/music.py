@@ -32,6 +32,46 @@ COOKIES_FILE = os.path.abspath(
 )
 IF_NOT_EXISTS = os.path.exists(COOKIES_FILE)
 
+
+def _normalize_cookie_file(path: str) -> str:
+    """Return a temp Netscape cookie file with tab separators so yt-dlp can parse it."""
+    if not os.path.exists(path):
+        return path
+
+    temp_path = None
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as source:
+            normalized_lines = []
+            for raw_line in source:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                tokens = line.split()
+                if len(tokens) < 7:
+                    continue
+                domain = tokens[0]
+                flag = tokens[1]
+                cookie_path = tokens[2]
+                secure = tokens[3]
+                expires = tokens[4]
+                name = tokens[5]
+                value = " ".join(tokens[6:])
+                normalized_lines.append(
+                    "\t".join([domain, flag, cookie_path, secure, expires, name, value])
+                    + "\n"
+                )
+
+        if not normalized_lines:
+            return path
+
+        temp_fd, temp_path = tempfile.mkstemp(prefix="mgy_cookies_", suffix=".txt")
+        with os.fdopen(temp_fd, "w", encoding="utf-8", newline="") as handle:
+            handle.writelines(normalized_lines)
+        return temp_path
+    except OSError:
+        return path
+
+
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
     "Accept": "*/*",
@@ -45,6 +85,8 @@ log = logging.getLogger("music")
 
 # Suppress noise about console usage from errors
 # yt_dlp.utils.bug_reports_message = lambda: ""
+
+NORMALIZED_COOKIES_FILE = _normalize_cookie_file(COOKIES_FILE)
 
 ytdl_format_options = {
     "format": "bestaudio[ext=webm]/bestaudio/best",
@@ -61,7 +103,7 @@ ytdl_format_options = {
     # bind to ipv4 since ipv6 addresses cause issues sometimes
     "source_address": "0.0.0.0",
     "verbose": True,
-    "cookiefile": COOKIES_FILE,
+    "cookiefile": NORMALIZED_COOKIES_FILE,
     "http_headers": BROWSER_HEADERS,
     "extractor_args": {
         "youtube": {"player_client": ["web_embedded", "web", "tv"]}
@@ -100,16 +142,25 @@ def _extract_cookie_header(path: str) -> str:
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
-                parts = line.split("\t")
+
+                parts = line.split()
                 if len(parts) < 7:
                     continue
-                domain, _, _, _, _, name, value = parts[:7]
-                if domain in {
-                    ".youtube.com",
-                    "youtube.com",
-                    ".google.com",
-                    "google.com",
-                }:
+
+                domain = parts[0]
+                name = parts[5]
+                value = " ".join(parts[6:])
+                if not name or not value:
+                    continue
+
+                if domain.startswith("."):
+                    domain = domain[1:]
+
+                if (
+                    domain in {"youtube.com", "google.com"}
+                    or domain.endswith(".youtube.com")
+                    or domain.endswith(".google.com")
+                ):
                     cookie_pairs.append(f"{name}={value}")
     except OSError:
         return ""
@@ -136,6 +187,45 @@ def _build_ffmpeg_headers(data: dict):
     if cookie_value:
         headers["Cookie"] = cookie_value
     return headers
+
+
+def _download_temp_fallback(current_url: str, data: dict):
+    """Download only the current track to a temp file as a last-resort fallback."""
+    temp_dir = tempfile.mkdtemp(prefix="mgy_music_")
+    fallback_opts = dict(ytdl_format_options)
+    fallback_opts.update(
+        {
+            "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+        }
+    )
+
+    try:
+        with yt_dlp.YoutubeDL(fallback_opts) as fallback_ytdl:
+            fallback_ytdl.download([current_url])
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        log.error("Temporary local fallback download failed: %s", exc)
+        return None
+
+    title = data.get("title") or "fallback"
+    candidates = [
+        os.path.join(temp_dir, f"{title}.webm"),
+        os.path.join(temp_dir, f"{title}.m4a"),
+        os.path.join(temp_dir, f"{title}.mp3"),
+        os.path.join(temp_dir, f"{title}.mp4"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+
+    for item in os.listdir(temp_dir):
+        full_path = os.path.join(temp_dir, item)
+        if item.lower().endswith((".webm", ".m4a", ".mp3", ".mp4")):
+            return full_path
+
+    return None
 
 
 def switch(guild_id: int):
@@ -246,48 +336,20 @@ class YTDLSource(discord.PCMVolumeTransformer):
                     "GoogleVideo stream rejected with 403; trying temporary fallback for %s",
                     current_url,
                 )
-                try:
-                    temp_dir = tempfile.mkdtemp(prefix="mgy_music_")
-                    fallback_opts = dict(ytdl_format_options)
-                    fallback_opts.update(
-                        {
-                            "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
-                            "quiet": True,
-                            "no_warnings": True,
-                            "noplaylist": True,
-                        }
-                    )
-                    with yt_dlp.YoutubeDL(fallback_opts) as fallback_ytdl:
-                        fallback_ytdl.download([current_url])
-                        fallback_file = os.path.join(
-                            temp_dir, f"{data.get('title', 'fallback')}.webm"
+                fallback_file = _download_temp_fallback(current_url, data)
+                if fallback_file:
+                    try:
+                        fallback_source = discord.FFmpegPCMAudio(
+                            fallback_file, **currentOptions
                         )
-                        if not os.path.exists(fallback_file):
-                            fallback_file = os.path.join(
-                                temp_dir,
-                                next(
-                                    (
-                                        x
-                                        for x in os.listdir(temp_dir)
-                                        if x.lower().endswith(
-                                            (".webm", ".m4a", ".mp3", ".mp4")
-                                        )
-                                    ),
-                                    "fallback.webm",
-                                ),
-                            )
-                        if os.path.exists(fallback_file):
-                            fallback_source = discord.FFmpegPCMAudio(
-                                fallback_file, **currentOptions
-                            )
-                            return cls(fallback_source, data=data)
-                except Exception as fallback_error:
-                    log.error(
-                        "Fallback local temp stream failed for %s: %s",
-                        current_url,
-                        fallback_error,
-                        exc_info=True,
-                    )
+                        return cls(fallback_source, data=data)
+                    except Exception as fallback_error:
+                        log.error(
+                            "Fallback local temp stream failed for %s: %s",
+                            current_url,
+                            fallback_error,
+                            exc_info=True,
+                        )
             log.error("Erro ao criar FFmpeg Audio: %s", e)
             await asyncio.sleep(1)
 
@@ -590,6 +652,7 @@ class Music(commands.Cog):
                 if player and ctx.voice_client:
                     # Inicia a tocar
                     try:
+                        current_queue_item = self.queue[ctx.guild.id][0]
                         ctx.voice_client.play(player, after=nextOrCleanUp)
                         self.guild_start_time[ctx.guild.id] = time.monotonic()
                         # Bonus room
@@ -623,8 +686,8 @@ class Music(commands.Cog):
                                 + ")"
                                 + (
                                     ""
-                                    if await self.is_url(self.queue[ctx.guild.id][0])
-                                    else "\n Pesquisado: " + self.queue[ctx.guild.id][0]
+                                    if await self.is_url(current_queue_item)
+                                    else "\n Pesquisado: " + current_queue_item
                                 )
                                 + "\n Duração: {:02d}:{:02d}\nAinda na lista: {}".format(
                                     int(minutes),
@@ -647,8 +710,8 @@ class Music(commands.Cog):
                                 + ")"
                                 + (
                                     ""
-                                    if await self.is_url(self.queue[ctx.guild.id][0])
-                                    else "\n Pesquisado: " + self.queue[ctx.guild.id][0]
+                                    if await self.is_url(current_queue_item)
+                                    else "\n Pesquisado: " + current_queue_item
                                 )
                                 + "\n Duração: {:02d}:{:02d}".format(
                                     int(minutes), int(seconds)
