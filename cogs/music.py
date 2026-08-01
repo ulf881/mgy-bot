@@ -110,9 +110,13 @@ class YTDLSource(discord.PCMVolumeTransformer):
         ydl = yt_dlp.YoutubeDL(ytdl_format_options)
 
         # Escolhe opções de FFmpeg com base no equalizador e skip
-        currentOptions = (ffmpeg_options).copy()
+        currentOptions = ffmpeg_options.copy()
+        before = currentOptions.get("before_options", "")
+
         if extraBeforeOptions:
-            currentOptions["before_options"] += f" {extraBeforeOptions}"
+            before = f"{before} {extraBeforeOptions}".strip()
+
+        currentOptions["before_options"] = before
 
         if extraOptions:
             currentOptions["options"] = (
@@ -172,7 +176,9 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
             if header_strings:
                 combined_headers = "\r\n".join(header_strings) + "\r\n"
-                before += f' -headers "{combined_headers}"'
+                before = currentOptions.get("before_options", "")
+                before = f'{before} -headers "{combined_headers}"'.strip()
+                currentOptions["before_options"] = before
 
         try:
             audio_source = discord.FFmpegPCMAudio(filename, **currentOptions)
