@@ -112,9 +112,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
         # Escolhe opções de FFmpeg com base no equalizador e skip
         currentOptions = (ffmpeg_options).copy()
         if extraBeforeOptions:
-            before += f" {extraBeforeOptions}"
-
-        currentOptions["before_options"] = before
+            currentOptions["before_options"] += f" {extraBeforeOptions}"
 
         if extraOptions:
             currentOptions["options"] = (
