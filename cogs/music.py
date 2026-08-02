@@ -37,9 +37,14 @@ BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "cross-site",
+    "Sec-Fetch-Dest": "audio",
     "Referer": "https://www.youtube.com/",
     "Origin": "https://www.youtube.com",
 }
+
+YOUTUBE_PLAYER_CLIENTS = ["web_embedded", "web", "tv", "android", "mweb"]
 
 # Inicia o logger
 log = logging.getLogger("music")
@@ -64,9 +69,7 @@ ytdl_format_options = {
     "verbose": True,
     "cookiefile": COOKIES_FILE,
     "http_headers": BROWSER_HEADERS,
-    "extractor_args": {
-        "youtube": {"player_client": ["web_embedded", "web", "tv"]}
-    },  # android?
+    "extractor_args": {"youtube": {"player_client": YOUTUBE_PLAYER_CLIENTS}},
 }
 
 ffmpeg_options = {
@@ -115,9 +118,11 @@ def _extract_cookie_header(path: str) -> str:
                     domain = domain[1:]
 
                 if (
-                    domain in {"youtube.com", "google.com"}
+                    domain in {"youtube.com", "google.com", "googlevideo.com"}
                     or domain.endswith(".youtube.com")
                     or domain.endswith(".google.com")
+                    or domain.endswith(".googlevideo.com")
+                    or domain.endswith(".youtube-nocookie.com")
                 ):
                     cookie_pairs.append(f"{name}={value}")
     except OSError:
@@ -147,8 +152,24 @@ def _build_ffmpeg_headers(data: dict):
     return headers
 
 
+def _log_ffmpeg_headers(label: str, url: str, headers: dict):
+    """Log the ffmpeg headers for direct stream debugging without dumping the full cookie."""
+    if not headers:
+        return
+
+    safe_headers = {}
+    for key, value in headers.items():
+        if key.lower() == "cookie":
+            safe_headers[key] = value[:80] + ("..." if len(value) > 80 else "")
+        else:
+            safe_headers[key] = value
+
+    log.warning("%s | url=%s | headers=%s", label, url, safe_headers)
+
+
 def _download_temp_fallback(current_url: str, data: dict):
     """Download only the current track to a temp file as a last-resort fallback."""
+    log.info("Attempting temporary local fallback download for %s", current_url)
     temp_dir = tempfile.mkdtemp(prefix="mgy_music_")
     fallback_opts = dict(ytdl_format_options)
     fallback_opts.update(
@@ -164,7 +185,9 @@ def _download_temp_fallback(current_url: str, data: dict):
         with yt_dlp.YoutubeDL(fallback_opts) as fallback_ytdl:
             fallback_ytdl.download([current_url])
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        log.error("Temporary local fallback download failed: %s", exc)
+        log.error(
+            "Temporary local fallback of %s download failed: %s", current_url, exc
+        )
         return None
 
     title = data.get("title") or "fallback"
@@ -285,31 +308,54 @@ class YTDLSource(discord.PCMVolumeTransformer):
             before = f'{before} -headers "{combined_headers}"'.strip()
             currentOptions["before_options"] = before
 
+        _log_ffmpeg_headers("ffmpeg headers before open", filename, headers)
+
         try:
             audio_source = discord.FFmpegPCMAudio(filename, **currentOptions)
             return cls(audio_source, data=data)
 
         except Exception as e:
             error_text = str(e).lower()
-            if stream and ("403" in error_text or "forbidden" in error_text):
-                log.warning(
-                    "GoogleVideo stream rejected with 403; trying temporary fallback for %s",
-                    current_url,
-                )
-                fallback_file = _download_temp_fallback(current_url, data)
-                if fallback_file:
-                    try:
-                        fallback_source = discord.FFmpegPCMAudio(
-                            fallback_file, **currentOptions
-                        )
-                        return cls(fallback_source, data=data)
-                    except Exception as fallback_error:
-                        log.error(
-                            "Fallback local temp stream failed for %s: %s",
-                            current_url,
-                            fallback_error,
-                            exc_info=True,
-                        )
+            log.error(
+                "Erro ao criar FFmpeg Audio para %s com headers %s: %s",
+                filename,
+                {
+                    k: v[:80] + ("..." if len(v) > 80 else "")
+                    for k, v in headers.items()
+                },
+                e,
+                exc_info=True,
+            )
+
+            # if stream and ("403" in error_text or "forbidden" in error_text):
+            #     log.warning(
+            #         "GoogleVideo direct stream rejected with 403 for %s; retrying as downloaded file",
+            #         current_url,
+            #     )
+            #     # retry = await cls.from_url(
+            #     #     [current_url],
+            #     #     extraBeforeOptions,
+            #     #     extraOptions,
+            #     #     loop=loop,
+            #     #     stream=False,
+            #     # )
+            #     # if retry is not None:
+            #     #     return retry
+
+            #     fallback_file = _download_temp_fallback(current_url, data)
+            #     if fallback_file:
+            #         try:
+            #             fallback_source = discord.FFmpegPCMAudio(
+            #                 fallback_file, **currentOptions
+            #             )
+            #             return cls(fallback_source, data=data)
+            #         except Exception as fallback_error:
+            #             log.error(
+            #                 "Fallback local temp stream failed for %s: %s",
+            #                 current_url,
+            #                 fallback_error,
+            #                 exc_info=True,
+            #             )
             log.error("Erro ao criar FFmpeg Audio: %s", e)
             await asyncio.sleep(1)
 
