@@ -44,7 +44,7 @@ BROWSER_HEADERS = {
     "Origin": "https://www.youtube.com",
 }
 
-YOUTUBE_PLAYER_CLIENTS = ["web_embedded", "web", "tv", "android", "mweb"]
+YOUTUBE_PLAYER_CLIENTS = ["web_embedded", "web", "tv", "mweb"]
 
 # Inicia o logger
 log = logging.getLogger("music")
