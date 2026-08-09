@@ -542,6 +542,7 @@ class Music(commands.Cog):
                 offset = 0
                 response = sp.playlist_tracks(
                     pagina,
+                    limit=100,
                     offset=offset,
                     fields="items.track.name,items.track.artists.name",
                 )
