@@ -542,18 +542,18 @@ class Music(commands.Cog):
                 offset = 0
                 response = sp.playlist_tracks(
                     pagina,
-                    limit=100,
+                    limit=50,
                     offset=offset,
                     fields="items.track.name,items.track.artists.name",
                 )
 
                 tracks = response["items"]
-                while len(response["items"]) >= 100:
-                    offset += 100
+                while len(response["items"]) >= 50:
+                    offset += 50
                     response = sp.playlist_tracks(
                         pagina,
                         offset=offset,
-                        limit=100,
+                        limit=50,
                         fields="items.track.name,items.track.artists.name",
                     )
                     tracks.extend(response["items"])
