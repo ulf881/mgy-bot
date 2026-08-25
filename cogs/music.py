@@ -223,6 +223,9 @@ class YTDLSource(discord.PCMVolumeTransformer):
     Classe para definir parametros do YTDL
     """
 
+    _extract_lock = None
+    _max_extract_attempts = 10
+
     def __init__(self, source, *, data: dict, volume=0.5):
         super().__init__(source, volume)
 
@@ -245,6 +248,9 @@ class YTDLSource(discord.PCMVolumeTransformer):
         data = None
         ydl = yt_dlp.YoutubeDL(ytdl_format_options)
 
+        if cls._extract_lock is None:
+            cls._extract_lock = asyncio.Lock()
+
         # Escolhe opções de FFmpeg com base no equalizador e skip
         currentOptions = ffmpeg_options.copy()
         before = currentOptions.get("before_options", "")
@@ -259,14 +265,19 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 f"{currentOptions.get('options', '')} {extraOptions}"
             )
 
-        while queue:
+        attempts = 0
+        max_attempts = min(len(queue), cls._max_extract_attempts)
+
+        while queue and attempts < max_attempts:
             try:
+                attempts += 1
                 current_url = queue[0]
 
                 def extract():
                     return ydl.extract_info(current_url, download=not stream)
 
-                data = await loop.run_in_executor(None, extract)
+                async with cls._extract_lock:
+                    data = await loop.run_in_executor(None, extract)
 
                 if data and "entries" in data:
                     data = data["entries"][0]
@@ -280,6 +291,8 @@ class YTDLSource(discord.PCMVolumeTransformer):
             await asyncio.sleep(2)  # small delay before next try
         else:
             # Queue exhausted without valid data
+            if queue:
+                queue.clear()
             log.warning("Nenhuma URL válida encontrada na fila.")
             return None
 
@@ -315,7 +328,6 @@ class YTDLSource(discord.PCMVolumeTransformer):
             return cls(audio_source, data=data)
 
         except Exception as e:
-            error_text = str(e).lower()
             log.error(
                 "Erro ao criar FFmpeg Audio para %s com headers %s: %s",
                 filename,
@@ -326,36 +338,6 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 e,
                 exc_info=True,
             )
-
-            # if stream and ("403" in error_text or "forbidden" in error_text):
-            #     log.warning(
-            #         "GoogleVideo direct stream rejected with 403 for %s; retrying as downloaded file",
-            #         current_url,
-            #     )
-            #     # retry = await cls.from_url(
-            #     #     [current_url],
-            #     #     extraBeforeOptions,
-            #     #     extraOptions,
-            #     #     loop=loop,
-            #     #     stream=False,
-            #     # )
-            #     # if retry is not None:
-            #     #     return retry
-
-            #     fallback_file = _download_temp_fallback(current_url, data)
-            #     if fallback_file:
-            #         try:
-            #             fallback_source = discord.FFmpegPCMAudio(
-            #                 fallback_file, **currentOptions
-            #             )
-            #             return cls(fallback_source, data=data)
-            #         except Exception as fallback_error:
-            #             log.error(
-            #                 "Fallback local temp stream failed for %s: %s",
-            #                 current_url,
-            #                 fallback_error,
-            #                 exc_info=True,
-            #             )
             log.error("Erro ao criar FFmpeg Audio: %s", e)
             await asyncio.sleep(1)
 
@@ -639,12 +621,15 @@ class Music(commands.Cog):
             async with ctx.typing():
                 try:
                     player = None
+                    attempts = 0
                     while (
                         player is None
                         and self.queue
                         and self.queue[ctx.guild.id]
                         and len(self.queue[ctx.guild.id]) > 0
+                        and attempts < max(3, min(len(self.queue[ctx.guild.id]), 5))
                     ):
+                        attempts += 1
                         player = await YTDLSource.from_url(
                             self.queue[ctx.guild.id],
                             extraBeforeOptions,
@@ -735,6 +720,7 @@ class Music(commands.Cog):
                             self.message[ctx.guild.id] = await ctx.send(embed=embed)
                     except Exception as e:  # pylint: disable=broad-exception-caught
                         log.error("Deu ruim ao tocar! %s", e, exc_info=1)
+                        await asyncio.sleep(2)
 
     @commands.command(aliases=["vol", "v", "volmax", "maxvol", "volmilas"])
     async def volume(self, ctx: commands.Context, *args):
