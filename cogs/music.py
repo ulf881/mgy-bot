@@ -26,6 +26,8 @@ import tempfile
 from utils.pgdatabase import Postgres
 
 MAX_NUM = 100000
+YTDLP_SLOW_STARTUP_SECONDS = 10
+FFMPEG_SLOW_STARTUP_SECONDS = 5
 
 COOKIES_FILE = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "cookies.txt")
@@ -66,15 +68,17 @@ ytdl_format_options = {
     "default_search": "auto",
     # bind to ipv4 since ipv6 addresses cause issues sometimes
     "source_address": "0.0.0.0",
-    "verbose": True,
+    "verbose": False,
+    "socket_timeout": 15,
     "cookiefile": COOKIES_FILE,
     "http_headers": BROWSER_HEADERS,
     "extractor_args": {"youtube": {"player_client": YOUTUBE_PLAYER_CLIENTS}},
+    "concurrent_fragment_downloads": 1,
 }
 
 ffmpeg_options = {
-    "before_options": "-nostdin -re -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn -sn -dn",
+    "before_options": "-nostdin -re -probesize 32k -analyzeduration 0 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    "options": "-vn -sn -dn -threads 1 -filter_threads 1 -filter_complex_threads 1 -loglevel error -nostats",
 }
 
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
@@ -243,13 +247,28 @@ class YTDLSource(discord.PCMVolumeTransformer):
         loop=None,
         stream=False,
     ):
+        """Serialize the complete yt-dlp and FFmpeg startup pipeline."""
+        if cls._extract_lock is None:
+            cls._extract_lock = asyncio.Lock()
+
+        async with cls._extract_lock:
+            return await cls._from_url_locked(
+                queue, extraBeforeOptions, extraOptions, loop, stream
+            )
+
+    @classmethod
+    async def _from_url_locked(
+        cls,
+        queue: List[str],
+        extraBeforeOptions: str,
+        extraOptions: str,
+        loop=None,
+        stream=False,
+    ):
         """Retira informações da URL e lida com a fila."""
         loop = loop or asyncio.get_event_loop()
         data = None
         ydl = yt_dlp.YoutubeDL(ytdl_format_options)
-
-        if cls._extract_lock is None:
-            cls._extract_lock = asyncio.Lock()
 
         # Escolhe opções de FFmpeg com base no equalizador e skip
         currentOptions = ffmpeg_options.copy()
@@ -267,6 +286,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
         attempts = 0
         max_attempts = min(len(queue), cls._max_extract_attempts)
+        startup_started_at = time.monotonic()
 
         while queue and attempts < max_attempts:
             try:
@@ -276,8 +296,15 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 def extract():
                     return ydl.extract_info(current_url, download=not stream)
 
-                async with cls._extract_lock:
-                    data = await loop.run_in_executor(None, extract)
+                extract_started_at = time.monotonic()
+                data = await loop.run_in_executor(None, extract)
+                extract_elapsed = time.monotonic() - extract_started_at
+                if extract_elapsed >= YTDLP_SLOW_STARTUP_SECONDS:
+                    log.warning(
+                        "yt-dlp startup took %.1fs for %s",
+                        extract_elapsed,
+                        current_url,
+                    )
 
                 if data and "entries" in data:
                     data = data["entries"][0]
@@ -324,7 +351,17 @@ class YTDLSource(discord.PCMVolumeTransformer):
         _log_ffmpeg_headers("ffmpeg headers before open", filename, headers)
 
         try:
+            ffmpeg_started_at = time.monotonic()
             audio_source = discord.FFmpegPCMAudio(filename, **currentOptions)
+            ffmpeg_elapsed = time.monotonic() - ffmpeg_started_at
+            total_elapsed = time.monotonic() - startup_started_at
+            if ffmpeg_elapsed >= FFMPEG_SLOW_STARTUP_SECONDS:
+                log.warning(
+                    "FFmpeg startup took %.1fs for %s",
+                    ffmpeg_elapsed,
+                    filename,
+                )
+            log.info("Audio startup completed in %.1fs", total_elapsed)
             return cls(audio_source, data=data)
 
         except Exception as e:
