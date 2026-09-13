@@ -268,7 +268,8 @@ class YTDLSource(discord.PCMVolumeTransformer):
         """Retira informações da URL e lida com a fila."""
         loop = loop or asyncio.get_event_loop()
         data = None
-        ydl = yt_dlp.YoutubeDL(ytdl_format_options)
+        # maybe use ytdl global?
+        extractor = yt_dlp.YoutubeDL(ytdl_format_options)
 
         # Escolhe opções de FFmpeg com base no equalizador e skip
         currentOptions = ffmpeg_options.copy()
@@ -293,11 +294,10 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 attempts += 1
                 current_url = queue[0]
 
-                def extract():
-                    return ydl.extract_info(current_url, download=not stream)
-
                 extract_started_at = time.monotonic()
-                data = await loop.run_in_executor(None, extract)
+                data = await loop.run_in_executor(
+                    None, extractor.extract_info, current_url, not stream
+                )
                 extract_elapsed = time.monotonic() - extract_started_at
                 if extract_elapsed >= YTDLP_SLOW_STARTUP_SECONDS:
                     log.warning(
@@ -334,7 +334,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 log.info("========================\n")
 
             else:
-                filename = ydl.prepare_filename(data)
+                filename = extractor.prepare_filename(data)
 
         except Exception as e:
             log.error("Erro ao preparar filename: %s", e)
