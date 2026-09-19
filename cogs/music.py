@@ -28,6 +28,7 @@ from utils.pgdatabase import Postgres
 MAX_NUM = 100000
 YTDLP_SLOW_STARTUP_SECONDS = 10
 FFMPEG_SLOW_STARTUP_SECONDS = 5
+YTDLP_EXTRACT_TIMEOUT_SECONDS = 45
 
 COOKIES_FILE = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "cookies.txt")
@@ -77,7 +78,7 @@ ytdl_format_options = {
 }
 
 ffmpeg_options = {
-    "before_options": "-nostdin -re -probesize 32k -analyzeduration 0 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    "before_options": "-nostdin -re -probesize 32k -analyzeduration 0 -rw_timeout 15000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_max_retries 3",
     "options": "-vn -sn -dn -threads 1 -filter_threads 1 -filter_complex_threads 1 -loglevel error -nostats",
 }
 
@@ -295,8 +296,11 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 current_url = queue[0]
 
                 extract_started_at = time.monotonic()
-                data = await loop.run_in_executor(
-                    None, extractor.extract_info, current_url, not stream
+                data = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None, extractor.extract_info, current_url, not stream
+                    ),
+                    timeout=YTDLP_EXTRACT_TIMEOUT_SECONDS,
                 )
                 extract_elapsed = time.monotonic() - extract_started_at
                 if extract_elapsed >= YTDLP_SLOW_STARTUP_SECONDS:
@@ -648,11 +652,15 @@ class Music(commands.Cog):
                 else:
                     log.info("Ready to play next song")
                     coro = self.tocar(ctx)
-                fut = asyncio.run_coroutine_threadsafe(coro, self.bot.loop)
-                try:
-                    fut.result()
-                except Exception as e:  # pylint: disable=broad-exception-caught
-                    log.error("After executado com erro! %s", e, exc_info=1)
+                future = asyncio.run_coroutine_threadsafe(coro, self.bot.loop)
+
+                def report_next_song_error(completed):
+                    try:
+                        completed.result()
+                    except Exception as e:  # pylint: disable=broad-exception-caught
+                        log.error("After executado com erro! %s", e, exc_info=1)
+
+                future.add_done_callback(report_next_song_error)
 
         if self.queue[ctx.guild.id]:
             async with ctx.typing():
