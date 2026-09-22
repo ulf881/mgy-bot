@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import asyncio
 import sys
+import json
 import random
 import re
 import logging
@@ -172,6 +173,59 @@ def _log_ffmpeg_headers(label: str, url: str, headers: dict):
     log.warning("%s | url=%s | headers=%s", label, url, safe_headers)
 
 
+async def _extract_info_isolated(url: str):
+    """Extract metadata in a killable process so yt-dlp cannot block the bot."""
+    command = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--dump-single-json",
+        "--skip-download",
+        "--no-playlist",
+        "--quiet",
+        "--no-warnings",
+        "--no-check-certificates",
+        "--default-search",
+        "auto",
+        "--socket-timeout",
+        "15",
+        "--format",
+        ytdl_format_options["format"],
+        "--source-address",
+        ytdl_format_options["source_address"],
+        "--extractor-args",
+        "youtube:player_client=" + ",".join(YOUTUBE_PLAYER_CLIENTS),
+    ]
+    if IF_NOT_EXISTS:
+        command.extend(["--cookies", COOKIES_FILE])
+    command.append(url)
+
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(), timeout=YTDLP_EXTRACT_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        raise TimeoutError(
+            f"yt-dlp extraction timed out after {YTDLP_EXTRACT_TIMEOUT_SECONDS}s"
+        )
+
+    if process.returncode != 0:
+        error = stderr.decode(errors="replace").strip()
+        raise RuntimeError(error or f"yt-dlp exited with {process.returncode}")
+
+    try:
+        return json.loads(stdout.decode(errors="replace"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("yt-dlp returned invalid JSON") from exc
+
+
 def _download_temp_fallback(current_url: str, data: dict):
     """Download only the current track to a temp file as a last-resort fallback."""
     log.info("Attempting temporary local fallback download for %s", current_url)
@@ -269,9 +323,6 @@ class YTDLSource(discord.PCMVolumeTransformer):
         """Retira informações da URL e lida com a fila."""
         loop = loop or asyncio.get_event_loop()
         data = None
-        # maybe use ytdl global?
-        extractor = yt_dlp.YoutubeDL(ytdl_format_options)
-
         # Escolhe opções de FFmpeg com base no equalizador e skip
         currentOptions = ffmpeg_options.copy()
         before = currentOptions.get("before_options", "")
@@ -296,12 +347,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 current_url = queue[0]
 
                 extract_started_at = time.monotonic()
-                data = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        None, extractor.extract_info, current_url, not stream
-                    ),
-                    timeout=YTDLP_EXTRACT_TIMEOUT_SECONDS,
-                )
+                data = await _extract_info_isolated(current_url)
                 extract_elapsed = time.monotonic() - extract_started_at
                 if extract_elapsed >= YTDLP_SLOW_STARTUP_SECONDS:
                     log.warning(
@@ -338,7 +384,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 log.info("========================\n")
 
             else:
-                filename = extractor.prepare_filename(data)
+                filename = yt_dlp.YoutubeDL(ytdl_format_options).prepare_filename(data)
 
         except Exception as e:
             log.error("Erro ao preparar filename: %s", e)
@@ -1046,7 +1092,11 @@ class Music(commands.Cog):
                 j = 1
 
                 for x in self.queue[ctx.guild.id]:
-                    info = ytdl.extract_info(x, download=False)
+                    try:
+                        info = await _extract_info_isolated(x)
+                    except Exception as exc:  # pylint: disable=broad-exception-caught
+                        log.warning("Erro ao buscar item da fila '%s': %s", x, exc)
+                        info = None
                     if info:
                         if info.get("title"):
                             titulo = info.get("title")
@@ -1120,7 +1170,11 @@ class Music(commands.Cog):
             # percorre os links, pega o nome e compara com o especificado
             log.info("Iniciando comparacao com o dropbox")
             for x in mashups:
-                info = ytdl.extract_info(x, download=False)
+                try:
+                    info = await _extract_info_isolated(x)
+                except Exception as exc:  # pylint: disable=broad-exception-caught
+                    log.warning("Erro ao buscar mashup '%s': %s", x, exc)
+                    continue
                 nome = info.get("title")
                 achou = 1
                 for i in range(len(num)):
@@ -1304,7 +1358,13 @@ class Music(commands.Cog):
                     log.info("Buscando musica: %s", str(name))
                     resultado = self.pg.query(sql)
                     if resultado:
-                        info = ytdl.extract_info(url, download=False)
+                        try:
+                            info = await _extract_info_isolated(url)
+                        except (
+                            Exception
+                        ) as exc:  # pylint: disable=broad-exception-caught
+                            log.warning("Erro ao buscar título de '%s': %s", url, exc)
+                            info = None
                         titulo = " "
                         if info:
                             if info.get("title"):
