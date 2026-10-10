@@ -156,7 +156,9 @@ class Mod(commands.Cog, name="Mod"):
             " and SERVIDOR_ID = SERVIDORES.ID_SERVIDORES"
         )
 
-        resultado = await self.pg.aquery(sql, (mention.id, ctx.guild.id))
+        resultado = await self.pg.aquery(
+            sql, (str(mention.id), str(ctx.guild.id))
+        )
         if not resultado:
             await ctx.send("Usuario não encontrado")
             return
@@ -269,7 +271,9 @@ class Mod(commands.Cog, name="Mod"):
             " AND NIVEL_ID = NIVEIS.ID_NIVEIS"
             " AND SERVIDOR_ID = SERVIDORES.ID_SERVIDORES"
         )
-        resultado = await self.pg.aquery(sql, (ctx.author.id, ctx.guild.id))
+        resultado = await self.pg.aquery(
+            sql, (str(ctx.author.id), str(ctx.guild.id))
+        )
         if not resultado:
             await ctx.send("Usuario não encontrado")
             return

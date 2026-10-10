@@ -158,7 +158,7 @@ class Level(commands.Cog, name="Level"):
             " and NIVEL_ID = NIVEIS.ID_NIVEIS"
             " and SERVIDOR_ID = SERVIDORES.ID_SERVIDORES"
         )
-        return await self.pg.aquery(sql, (author, guild))
+        return await self.pg.aquery(sql, (str(author), str(guild)))
 
     async def update_user(self, info, user: discord.Member, guild: discord.Guild):
         """atualiza exp e evolui"""
@@ -201,7 +201,7 @@ class Level(commands.Cog, name="Level"):
         # busca id_servidor
         sql = "select * from SERVIDORES WHERE NUMERO_ID_SERVIDOR = %s"
 
-        resultado = await self.pg.aquery(sql, (guild.id,))
+        resultado = await self.pg.aquery(sql, (str(guild.id),))
 
         # Guild deve ser inserida antes no bd
         if not resultado:
@@ -211,7 +211,7 @@ class Level(commands.Cog, name="Level"):
                     "insert into SERVIDORES (NOME_SERVIDOR, NUMERO_ID_SERVIDOR)"
                     " values (%s, %s)"
                 )
-                await self.pg.aupdate(sql, (guild.name, guild.id))
+                await self.pg.aupdate(sql, (guild.name, str(guild.id)))
                 log.info("Guild %s adicionada", guild.name)
             except Exception as e:
                 log.error("Erro ao inserir guild %s", e)
@@ -224,7 +224,7 @@ class Level(commands.Cog, name="Level"):
             )
             try:
                 await self.pg.aupdate(
-                    sql, (author.name, author.id, resultado[0]["id_servidores"])
+                    sql, (author.name, str(author.id), resultado[0]["id_servidores"])
                 )
                 log.info("Usuario %s adicionado", author.name)
                 await self.update_role(author, 0, guild)
