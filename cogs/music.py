@@ -1091,7 +1091,27 @@ class Music(commands.Cog):
 
         if state.voice is None:
             if ctx.author.voice:
-                state.voice = await ctx.author.voice.channel.connect()
+                channel = ctx.author.voice.channel
+                log.info(
+                    "ensure_voice: conectando em '%s' (guild=%s, dpy_voice_client=%s)",
+                    channel,
+                    ctx.guild.id,
+                    ctx.voice_client,
+                )
+                started = time.monotonic()
+                try:
+                    state.voice = await channel.connect()
+                except Exception as e:  # pylint: disable=broad-exception-caught
+                    log.error(
+                        "ensure_voice: falha ao conectar apos %.1fs: %s",
+                        time.monotonic() - started,
+                        e,
+                        exc_info=True,
+                    )
+                    raise
+                log.info(
+                    "ensure_voice: conectado em %.1fs", time.monotonic() - started
+                )
                 try:
                     if not self.verifyalone.is_running():  # pylint: disable=no-member
                         self.verifyalone.start()  # pylint: disable=no-member

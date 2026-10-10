@@ -83,7 +83,7 @@ class Eventos(commands.Cog, name="Eventos"):
         if message.guild is None:
             return
 
-        log.debug(
+        log.info(
             "%s: %s: %s",
             message.channel,
             message.author,
@@ -124,7 +124,7 @@ class Eventos(commands.Cog, name="Eventos"):
                 )
                 self.counter_lembra = 0
             else:
-                log.debug("counterLembra: %s", str(self.counter_lembra))
+                log.info("counterLembra: %s", str(self.counter_lembra))
 
             if self.counter_frota >= 20 and randint(1, 100) <= 24:
                 self.counter_frota = 0
@@ -138,7 +138,7 @@ class Eventos(commands.Cog, name="Eventos"):
                 await default_channel.send(file=discord.File(data, "cool_image.png"))
 
             else:
-                log.debug("counterFrota: %s", str(self.counter_frota))
+                log.info("counterFrota: %s", str(self.counter_frota))
 
         # 1% de chance de kickar o usuario do canal de voz
         if message.author.id in self.kick_list:

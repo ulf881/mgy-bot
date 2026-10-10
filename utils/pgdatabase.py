@@ -45,6 +45,7 @@ class Postgres:
                 user=os.getenv("DB_USER"),
                 password=os.getenv("DB_PASSWORD"),
                 dbname=os.getenv("DB_NAME"),
+                connect_timeout=10,
             )
             self.cursor = self.connection.cursor(
                 cursor_factory=psycopg2.extras.DictCursor
@@ -79,12 +80,11 @@ class Postgres:
 
     def query(self, query: str, params=None):
         """Executa uma query sql e retorna uma lista de dicionarios."""
-        if not self._ensure_connection():
-            return None
-
         with self._db_lock:
+            if not self._ensure_connection():
+                return None
             try:
-                log.debug("Executando query")
+                log.info("Executando: %s params=%s", query, params)
                 self.cursor.execute(query, params)
                 result = self.cursor.fetchall()
                 # cuidado com nomes de colunas repetidos
@@ -100,12 +100,11 @@ class Postgres:
 
     def update(self, query: str, params=None):
         """Executa uma query de escrita e faz commit."""
-        if not self._ensure_connection():
-            return None
-
         with self._db_lock:
+            if not self._ensure_connection():
+                return None
             try:
-                log.debug("Executando update")
+                log.info("Executando: %s params=%s", query, params)
                 self.cursor.execute(query, params)
             except Exception as error:  # pylint: disable=broad-exception-caught
                 log.error("Erro ao executar update: %s", error)
