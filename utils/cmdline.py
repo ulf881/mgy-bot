@@ -3,7 +3,8 @@ Prepara argumentos e banner do programa
 """
 
 import logging
-from utils import __version__, __program__, __author__, __email__
+
+from utils import __author__, __email__, __program__, __version__
 
 log = logging.getLogger("cmdline")
 
@@ -17,7 +18,7 @@ def banner():
     print(__program__ + " v" + __version__, end="")
     print(
         r"""
-     _ _                       _ 
+     _ _                       _
     | (_)                     | |
   __| |_ ___  ___ ___  _ __ __| |
  / _` | / __|/ __/ _ \| '__/ _` |

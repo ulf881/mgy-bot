@@ -2,16 +2,16 @@
 Bot MGY para discord, toca musica e zoa com o max
 """
 
-import sys
-import asyncio
 import logging
+import os
+
 import discord
 from discord.ext import commands
-from utils import logger, __program__  # pylint: disable=unused-import # noqa: F401
+from dotenv import load_dotenv
+
+from utils import __program__, logger  # pylint: disable=unused-import # noqa: F401
 from utils.cmdline import banner
 from utils.pgdatabase import Postgres
-import os
-from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
@@ -75,10 +75,8 @@ bot.bonusXP = False
 log = logging.getLogger("main")
 
 
-# after using async_with
-async def main():
-    """Main"""
-
+async def setup_hook():
+    """Carrega as extensoes no loop correto do bot."""
     log.debug(
         "##################### Iniciando %s #########################", __program__
     )
@@ -89,14 +87,11 @@ async def main():
         try:
             await bot.load_extension(extension)
         except Exception as e:  # pylint: disable=broad-exception-caught
-            log.critical("Failed to load extensions {extensions}. %s", e, exc_info=True)
-            sys.exit()
+            log.critical("Failed to load extensions %s. %s", extension, e, exc_info=True)
+            raise
 
 
-if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    loop.run_until_complete(main())
-    loop.close()
+bot.setup_hook = setup_hook
 
 
 @bot.event
@@ -108,9 +103,6 @@ async def on_ready():
         bot.user.id,
         discord.__version__,
     )
-
-    # for guild in bot.guilds:
-    #     print(guild.id)
 
     # Changes Playing Status. type=1(streaming) for a standard game you could remove type and url.
     await bot.change_presence(activity=discord.Game(name=os.environ["NAME"], type=1))

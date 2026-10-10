@@ -2,13 +2,14 @@
 Modulo para games. AKA CrappyDungeon
 """
 
+import asyncio
 import logging
 import os
+import re
+import subprocess
+import sys
 from pathlib import Path
 from random import randint
-import re
-import sys
-import subprocess
 
 import aiohttp
 import discord
@@ -19,14 +20,21 @@ from utils.pgdatabase import Postgres
 
 log = logging.getLogger("Mod")
 
+COOKIE_FAIL_MESSAGE = (
+    "Não foi possível encontrar uma alternativa de embed funcional para o seu "
+    "link do Instagram. As alternativas podem mudar com o tempo ou o link pode "
+    "ser privado/inexistente."
+)
 
-def switch(guild_id: int):
-    """Switch case para pegar macro"""
-    print(guild_id)
-    return {
-        1192899104330743998: os.environ["MACRO"],
-        582709300506656792: os.environ["MACRO2"],
-    }.get(guild_id, "MGY")
+# Limite de mensagens por canal ao calcular o total no comando info.
+INFO_HISTORY_PER_CHANNEL = 5000
+
+
+def _pip_install_ytdlp():
+    """Atualiza o yt-dlp. Roda em uma thread (usar asyncio.to_thread)."""
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "-U", "--pre", "yt-dlp[default]"]
+    )
 
 
 class Mod(commands.Cog, name="Mod"):
@@ -37,6 +45,16 @@ class Mod(commands.Cog, name="Mod"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.pg = Postgres()
+        self._session: aiohttp.ClientSession | None = None
+
+    async def cog_unload(self):
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+
+    def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
 
     @commands.command(aliases=["del", "rem"])
     @commands.has_role("Staff")
@@ -62,17 +80,8 @@ class Mod(commands.Cog, name="Mod"):
     async def restart(self, ctx: commands.Context):
         """Reset all"""
         await ctx.send("```Updating & restarting, aguarde uns 10-20s...```")
-        subprocess.check_call(
-            [
-                "python3",
-                "-m",
-                "pip",
-                "install",
-                "-U",
-                "--pre",
-                "yt-dlp[default]",
-            ]
-        )
+        # Instala em uma thread para nao travar o event loop.
+        await asyncio.to_thread(_pip_install_ytdlp)
         os.execl(sys.executable, sys.executable, *sys.argv)
 
     @commands.command(hidden=True)
@@ -94,7 +103,6 @@ class Mod(commands.Cog, name="Mod"):
         )
 
         await ctx.message.delete()
-        print(await ctx.guild.fetch_member(user_id))
         user_obj = await ctx.guild.fetch_member(user_id)
         await user_obj.move_to(channel)
 
@@ -108,17 +116,16 @@ class Mod(commands.Cog, name="Mod"):
         us para us-south
         nome completo para outros.
         """
+        new_reg = "brazil"
         try:
             if "us" in args:
                 new_reg = "us-south"
-            elif not args:
-                new_reg = "us-south"
-                await ctx.author.voice.channel.edit(rtc_region=new_reg)
-                new_reg = "brazil"
+            elif args:
+                new_reg = args[0]
 
             await ctx.author.voice.channel.edit(rtc_region=new_reg)
             await ctx.send("Alterado para região: " + new_reg)
-            log.info("Alterado para região: %d", new_reg)
+            log.info("Alterado para região: %s", new_reg)
         except Exception as error:  # pylint: disable=broad-except
             await ctx.send(
                 "```Erro ao alterar para a regiao: "
@@ -141,26 +148,33 @@ class Mod(commands.Cog, name="Mod"):
         else:
             mention = ctx.author
 
-        sql = "select * from USUARIOS,NIVEIS,SERVIDORES"
-        sql += " WHERE USER_ID_DISCORD = '" + str(mention.id) + "'"
-        sql += " AND NUMERO_ID_SERVIDOR = '" + str(ctx.guild.id) + "'"
-        sql += " and NIVEL_ID = NIVEIS.ID_NIVEIS"
-        sql += " and SERVIDOR_ID = SERVIDORES.ID_SERVIDORES"
+        sql = (
+            "select * from USUARIOS,NIVEIS,SERVIDORES"
+            " WHERE USER_ID_DISCORD = %s"
+            " AND NUMERO_ID_SERVIDOR = %s"
+            " and NIVEL_ID = NIVEIS.ID_NIVEIS"
+            " and SERVIDOR_ID = SERVIDORES.ID_SERVIDORES"
+        )
 
-        resultado = self.pg.query(sql)
-        if resultado[0]["youtube"]:
-            links = "[youtube]" + "(" + resultado[0]["youtube"] + ")"
-        if resultado[0]["twitch"]:
-            links += ", [twitch]" + "(" + resultado[0]["twitch"] + ")"
-        if resultado[0]["twitter"]:
-            links += ", [twitter]" + "(" + resultado[0]["twitter"] + ")"
-        if resultado[0]["outros"]:
-            outros = resultado[0]["outros"].split(",")
+        resultado = await self.pg.aquery(sql, (mention.id, ctx.guild.id))
+        if not resultado:
+            await ctx.send("Usuario não encontrado")
+            return
+        info = resultado[0]
+        if info["youtube"]:
+            links = "[youtube]" + "(" + info["youtube"] + ")"
+        if info["twitch"]:
+            links += ", [twitch]" + "(" + info["twitch"] + ")"
+        if info["twitter"]:
+            links += ", [twitter]" + "(" + info["twitter"] + ")"
+        if info["outros"]:
+            outros = info["outros"].split(",")
             for name_link in outros:
                 # separa o nome do link
                 field = name_link.split(" ")
-                log.info(field)
-                links += ", [" + field[0] + "]" + "(" + field[1] + ")"
+                log.debug(field)
+                if len(field) >= 2:
+                    links += ", [" + field[0] + "]" + "(" + field[1] + ")"
 
         embed = discord.Embed(colour=mention.color)
 
@@ -178,9 +192,9 @@ class Mod(commands.Cog, name="Mod"):
         embed.add_field(name="Mensagens eviadas", value="Calculando...")
         embed.add_field(
             name="Nível atual",
-            value=str(resultado[0]["nivel_id"]) + "-" + resultado[0]["nome_nivel"],
+            value=str(info["nivel_id"]) + "-" + info["nome_nivel"],
         )
-        embed.add_field(name="Expêriencia", value=resultado[0]["experiencia"])
+        embed.add_field(name="Expêriencia", value=info["experiencia"])
         if len(links) > 0:
             embed.add_field(name="Links", value=links)
         # goto
@@ -206,8 +220,10 @@ class Mod(commands.Cog, name="Mod"):
 
         message = await ctx.send(embed=embed)
 
+        # Conta as mensagens do usuario. limitado por canal para nao varrer
+        # o historico inteiro do servidor (caro).
         for channel in ctx.guild.text_channels:
-            async for msg in channel.history(limit=None):
+            async for msg in channel.history(limit=INFO_HISTORY_PER_CHANNEL):
                 if msg.author == mention:
                     count += 1
                 total += 1
@@ -244,13 +260,19 @@ class Mod(commands.Cog, name="Mod"):
         colunas = ["youtube", "twitch", "twitter", "instagram", "outros"]
         if column not in colunas:
             await ctx.send(column + " não existe. Tente inserir em 'outros'")
+            return
 
-        sql = "select * from USUARIOS,NIVEIS,SERVIDORES"
-        sql += " WHERE USER_ID_DISCORD = '" + str(ctx.author.id) + "'"
-        sql += " AND NUMERO_ID_SERVIDOR = '" + str(ctx.guild.id) + "'"
-        sql += " AND NIVEL_ID = NIVEIS.ID_NIVEIS"
-        sql += " AND SERVIDOR_ID = SERVIDORES.ID_SERVIDORES"
-        resultado = self.pg.query(sql)
+        sql = (
+            "select * from USUARIOS,NIVEIS,SERVIDORES"
+            " WHERE USER_ID_DISCORD = %s"
+            " AND NUMERO_ID_SERVIDOR = %s"
+            " AND NIVEL_ID = NIVEIS.ID_NIVEIS"
+            " AND SERVIDOR_ID = SERVIDORES.ID_SERVIDORES"
+        )
+        resultado = await self.pg.aquery(sql, (ctx.author.id, ctx.guild.id))
+        if not resultado:
+            await ctx.send("Usuario não encontrado")
+            return
 
         if column == "outros":
             if not arg2:
@@ -261,10 +283,10 @@ class Mod(commands.Cog, name="Mod"):
             if resultado[0]["outros"]:
                 args += "," + (resultado[0]["outros"])
 
-        sql = "UPDATE USUARIOS SET " + column + " = '" + args + "'"
-        sql += " WHERE ID_USUARIOS = '" + str(resultado[0]["id_usuarios"]) + "'"
+        # `column` ja foi validado contra a whitelist `colunas`.
+        sql = "UPDATE USUARIOS SET " + column + " = %s WHERE ID_USUARIOS = %s"
 
-        if self.pg.update(sql):
+        if await self.pg.aupdate(sql, (args, resultado[0]["id_usuarios"])):
             await ctx.send("Atualizado")
         else:
             await ctx.send("Ocorreu um erro ao atualizar")
@@ -321,7 +343,7 @@ class Mod(commands.Cog, name="Mod"):
             )
 
         for i in range(first_number):
-            await ctx.send(print(randint(1, second_number)))
+            await ctx.send(str(randint(1, second_number)))
 
     @commands.command(hidden=True)
     async def instagram(self, ctx: commands.Context, url: str):
@@ -360,6 +382,7 @@ class Mod(commands.Cog, name="Mod"):
         original_domain = original_domain_match.group(0)
 
         found_working_embed = False
+        session = self._get_session()
         # Itera sobre os domínios alternativos definidos.
         for alt_domain in alternative_domains:
             # Constrói o URL transformado, substituindo o domínio original do Instagram.
@@ -372,34 +395,30 @@ class Mod(commands.Cog, name="Mod"):
                 # `allow_redirects=True` garante que sigamos quaisquer redirecionamentos
                 # que o serviço alternativo possa usar.
                 # `timeout` evita que o bot fique aguardando indefinidamente.
-                async with aiohttp.ClientSession() as session:
-                    async with session.head(
-                        transformed_url, allow_redirects=True, timeout=10
-                    ) as response:
-                        # Se o status da resposta for 200 OK, consideramos este um link
-                        # potencialmente incorporável, pois o serviço alternativo está acessível.
-                        if response.status == 200:
-                            # Envia apenas o link transformado para que o Discord tente incorporá-lo.
-                            await ctx.send(transformed_url)
-                            found_working_embed = True
-                            break  # Para após a primeira tentativa bem-sucedida
-                        # Não há necessidade de enviar uma mensagem se uma alternativa falhou com um status diferente de 200,
-                        # pois o usuário não quer ver o processo.
+                async with session.head(
+                    transformed_url, allow_redirects=True, timeout=10
+                ) as response:
+                    # Se o status da resposta for 200 OK, consideramos este um link
+                    # potencialmente incorporável, pois o serviço alternativo está acessível.
+                    if response.status == 200:
+                        # Envia apenas o link transformado para que o Discord tente incorporá-lo.
+                        await ctx.send(transformed_url)
+                        found_working_embed = True
+                        break  # Para após a primeira tentativa bem-sucedida
+                    # Não há necessidade de enviar uma mensagem se uma alternativa falhou com um status diferente de 200,
+                    # pois o usuário não quer ver o processo.
             except aiohttp.ClientError:
                 # Captura erros específicos do cliente aiohttp (por exemplo, problemas de DNS, conexão recusada).
                 # Não envia mensagem ao usuário sobre a falha.
                 pass
-            except Exception:
+            except Exception:  # pylint: disable=broad-exception-caught
                 # Captura quaisquer outros erros inesperados durante o processo.
                 # Não envia mensagem ao usuário sobre a falha.
                 pass
 
         # Se nenhum link incorporável foi encontrado após tentar todas as alternativas.
         if not found_working_embed:
-            await ctx.send(
-                "Não foi possível encontrar uma alternativa de embed funcional para o seu link do Instagram. "
-                "As alternativas podem mudar com o tempo ou o link pode ser privado/inexistente."
-            )
+            await ctx.send(COOKIE_FAIL_MESSAGE)
 
     @commands.command(hidden=True)
     async def twitter(self, ctx: commands.Context, url: str):
@@ -441,21 +460,20 @@ class Mod(commands.Cog, name="Mod"):
             # Usa aiohttp para fazer uma requisição HEAD.
             # `allow_redirects=True` para seguir redirecionamentos.
             # `timeout` para evitar esperas longas.
-            async with aiohttp.ClientSession() as session:
-                async with session.head(
-                    transformed_url, allow_redirects=True, timeout=10
-                ) as response:
-                    # Se o status da resposta for 200 OK, considera que o embed pode funcionar.
-                    if response.status == 200:
-                        # Envia apenas o link transformado para que o Discord tente incorporá-lo.
-                        await ctx.send(transformed_url)
-                    else:
-                        # Se fxtwitter.com não retornar 200 OK, informa o usuário.
-                        await ctx.send(
-                            f"Não foi possível gerar um embed usando `{alternative_domain}` para o link fornecido. "
-                            f"Status HTTP: `{response.status}`. "
-                            "O link pode ser privado, inexistente ou o serviço fxtwitter.com pode estar com problemas."
-                        )
+            async with self._get_session().head(
+                transformed_url, allow_redirects=True, timeout=10
+            ) as response:
+                # Se o status da resposta for 200 OK, considera que o embed pode funcionar.
+                if response.status == 200:
+                    # Envia apenas o link transformado para que o Discord tente incorporá-lo.
+                    await ctx.send(transformed_url)
+                else:
+                    # Se fxtwitter.com não retornar 200 OK, informa o usuário.
+                    await ctx.send(
+                        f"Não foi possível gerar um embed usando `{alternative_domain}` para o link fornecido. "
+                        f"Status HTTP: `{response.status}`. "
+                        "O link pode ser privado, inexistente ou o serviço fxtwitter.com pode estar com problemas."
+                    )
         except aiohttp.ClientError:
             # Captura erros de conexão (DNS, conexão recusada, etc.).
             await ctx.send(
@@ -467,7 +485,6 @@ class Mod(commands.Cog, name="Mod"):
             await ctx.send(
                 f"Ocorreu um erro inesperado: `{e}` ao tentar gerar o embed para o seu link do Twitter/X."
             )
-
 
 async def setup(bot: commands.Bot):
     """Adiciona cog ao bot"""

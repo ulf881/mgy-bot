@@ -10,8 +10,8 @@ requires-python = ">=3.13"
 dependencies = [
     "aiohttp==3.14.3",
     "beautifulsoup4==4.15.0",
+    "curl-cffi==0.16.3",
     "discord-py[voice]==2.7.1",
-    "flask==3.1.3",
     "google-api-python-client==2.198.0",
     "psycopg2==2.9.13",
     "psycopg2-binary==2.9.13",
@@ -23,16 +23,22 @@ dependencies = [
     "yt-dlp[default]>=2026.8.30.232658.dev0",
 ]
 
-[project.scripts]
-mgy-bot = "mgy_bot:main"
-
-[build-system]
-requires = ["uv_build>=0.12.13,<0.13.0"]
-build-backend = "uv_build"
-
 [dependency-groups]
 dev = [
     "flake8>=7.4.1",
     "pytest>=9.1.1",
     "ruff>=0.17.0",
 ]
+
+[tool.ruff]
+line-length = 200
+target-version = "py313"
+
+[tool.ruff.lint]
+# Regras pragmaticas: pycodestyle (E/W), pyflakes (F), isort (I).
+# Excecoes amplas (BLE001/S110) sao intencionais para chamadas de rede/FFmpeg.
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -2,14 +2,14 @@
 Modulo cuidar dos niveis dos usuarios
 """
 
-import os
 import logging
-import discord
 from random import randint
 
+import discord
 from discord.ext import commands
 from discord.utils import get
 
+from utils.config import guild_macro
 from utils.pgdatabase import Postgres
 
 log = logging.getLogger("Level")
@@ -17,15 +17,6 @@ BASE = 10  # Toda mensagem ganha a xp base
 MAX_RAND = 14  # Toda mensagem ganha aleatorio entre 1 e este valor
 MAX_LEVEL = 51  # Nivel máximo
 MULTIPLER = 1.1  # O quanto de XP a mais precisa em comparação ao lvl anterior
-
-
-def switchGuild(guild_id: int):
-    """Switch case para pegar macro"""
-    print(guild_id)
-    return {
-        1192899104330743998: os.environ["MACRO"],
-        582709300506656792: os.environ["MACRO2"],
-    }.get(guild_id, "MGY")
 
 
 def switch(x):
@@ -160,14 +151,14 @@ class Level(commands.Cog, name="Level"):
         """Consulta usuario"""
         if not self.pg:
             return
-        sql = "select * from USUARIOS,NIVEIS,SERVIDORES"
-        sql += " WHERE USER_ID_DISCORD = '" + str(author) + "'"
-        sql += " AND NUMERO_ID_SERVIDOR = '" + str(guild) + "'"
-        sql += " and NIVEL_ID = NIVEIS.ID_NIVEIS"
-        sql += " and SERVIDOR_ID = SERVIDORES.ID_SERVIDORES"
-
-        resultado = self.pg.query(sql)
-        return resultado
+        sql = (
+            "select * from USUARIOS,NIVEIS,SERVIDORES"
+            " WHERE USER_ID_DISCORD = %s"
+            " AND NUMERO_ID_SERVIDOR = %s"
+            " and NIVEL_ID = NIVEIS.ID_NIVEIS"
+            " and SERVIDOR_ID = SERVIDORES.ID_SERVIDORES"
+        )
+        return await self.pg.aquery(sql, (author, guild))
 
     async def update_user(self, info, user: discord.Member, guild: discord.Guild):
         """atualiza exp e evolui"""
@@ -180,27 +171,26 @@ class Level(commands.Cog, name="Level"):
             experiencia *= 2
         experiencia_atual = int(info[0]["experiencia"])
 
-        # Prepara sql para atualizar exp
-        sql = (
-            "update usuarios set experiencia = '"
-            + str(experiencia_atual + experiencia)
-            + "'"
-        )
+        sets = ["experiencia = %s"]
+        params = [experiencia_atual + experiencia]
 
         # Verifica se evoluiu
         experiencia_necessaria = await self.prox_nivel(level_atual)
         if (experiencia_atual + experiencia) >= int(experiencia_necessaria):
             # Verifica se nao esta no nivel maximo
             if level_atual < MAX_LEVEL:
-                sql += ", nivel_id = " + str(level_atual + 1)  # Evolui
+                sets.append("nivel_id = %s")  # Evolui
+                params.append(level_atual + 1)
                 result = level_atual + 1
                 await self.update_role(user, info[0]["nivel_id"], guild)
 
         # Atualiza total de menagens
-        sql += ", TOTAL_MENSAGENS = " + str(int(info[0]["total_mensagens"]) + 1)
-        sql += " where id_usuarios = " + str(info[0]["id_usuarios"])
+        sets.append("TOTAL_MENSAGENS = %s")
+        params.append(int(info[0]["total_mensagens"]) + 1)
+        params.append(info[0]["id_usuarios"])
 
-        self.pg.update(sql)
+        sql = "update usuarios set " + ", ".join(sets) + " where id_usuarios = %s"
+        await self.pg.aupdate(sql, tuple(params))
         return result
 
     async def insere_usuario(self, guild: discord.Guild, author: discord.Member):
@@ -209,41 +199,38 @@ class Level(commands.Cog, name="Level"):
             return
         log.info("Inserindo usuario")
         # busca id_servidor
-        sql = "select * from SERVIDORES"
-        sql += " WHERE NUMERO_ID_SERVIDOR = '" + str(guild.id) + "'"
+        sql = "select * from SERVIDORES WHERE NUMERO_ID_SERVIDOR = %s"
 
-        resultado = self.pg.query(sql)
+        resultado = await self.pg.aquery(sql, (guild.id,))
 
         # Guild deve ser inserida antes no bd
         if not resultado:
             try:
-                log.info("Inserindo usuario em " + str(guild.id))
-                sql = "insert into SERVIDORES (NOME_SERVIDOR, NUMERO_ID_SERVIDOR)"
-                sql += " values ('" + str(guild.name) + "', '" + str(guild.id) + "')"
-
-                self.pg.update(sql)
-                log.info("Guild " + guild.name + "adicionada")
+                log.info("Inserindo guild em %s", guild.id)
+                sql = (
+                    "insert into SERVIDORES (NOME_SERVIDOR, NUMERO_ID_SERVIDOR)"
+                    " values (%s, %s)"
+                )
+                await self.pg.aupdate(sql, (guild.name, guild.id))
+                log.info("Guild %s adicionada", guild.name)
             except Exception as e:
-                log.error("Erro ao inserir guild " + str(e))
+                log.error("Erro ao inserir guild %s", e)
                 raise
         else:
-            sql = "insert into USUARIOS (NOME_USUARIO, USER_ID_DISCORD, NIVEL_ID, EXPERIENCIA, SERVIDOR_ID)"
-            sql += (
-                " values ('"
-                + str(author.name)
-                + "', '"
-                + str(author.id)
-                + "', 1, 0,"
-                + str(resultado[0]["id_servidores"])
-                + ")"
+            sql = (
+                "insert into USUARIOS"
+                " (NOME_USUARIO, USER_ID_DISCORD, NIVEL_ID, EXPERIENCIA, SERVIDOR_ID)"
+                " values (%s, %s, 1, 0, %s)"
             )
             try:
-                self.pg.update(sql)
-                log.info("Usuario " + author.name + " adicionado")
+                await self.pg.aupdate(
+                    sql, (author.name, author.id, resultado[0]["id_servidores"])
+                )
+                log.info("Usuario %s adicionado", author.name)
                 await self.update_role(author, 0, guild)
 
             except Exception as e:
-                log.error("Erro ao inserir usuario " + str(e))
+                log.error("Erro ao inserir usuario %s", e)
                 raise
 
     async def update_total_messages(self, message: discord.Message):
@@ -252,18 +239,21 @@ class Level(commands.Cog, name="Level"):
             return
         resultado = await self.find_user(message.author.id, message.guild.id)
         if resultado:
-            sql = "update usuarios set TOTAL_MENSAGENS = "
-            sql += str(int(resultado[0]["total_mensagens"]) + 1)
-            sql += " where id_usuarios = " + str(resultado[0]["id_usuarios"])
-
-            self.pg.update(sql)
+            sql = "update usuarios set TOTAL_MENSAGENS = %s where id_usuarios = %s"
+            await self.pg.aupdate(
+                sql,
+                (
+                    int(resultado[0]["total_mensagens"]) + 1,
+                    resultado[0]["id_usuarios"],
+                ),
+            )
 
     async def update(self, message: discord.Message):
         """Atualiza"""
         if not self.pg:
             return
+        result = 0
         try:
-            result = 0
             # Consulta para buscar informacoes do usuario que enviou a mensagem
             resultado = await self.find_user(message.author.id, message.guild.id)
 
@@ -279,14 +269,12 @@ class Level(commands.Cog, name="Level"):
                     log.error(
                         "Error while connecting to PostgreSQL, %s", error, exc_info=1
                     )
-                    pass
             # Usuario nao encontrado, necessario criar
             else:
                 await self.insere_usuario(message.guild, message.author)
         except Exception as error:
             log.error("Erro ao buscar o usuario, %s", error, exc_info=1)
-        finally:
-            return result
+        return result
 
     @commands.command(aliases=["exp", "experiencia", "xp"])
     async def experience(self, ctx: commands.Context):
@@ -329,7 +317,7 @@ class Level(commands.Cog, name="Level"):
                 ),
             )
             embed.set_footer(
-                text=switchGuild(ctx.guild.id),
+                text=guild_macro(ctx.guild.id),
                 icon_url="https://cdn.discordapp.com/avatars/596088044877119507/0d26138b572e7dfffc6cab54073cdb31.webp",
             )
             await ctx.send(embed=embed)

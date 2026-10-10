@@ -2,6 +2,7 @@
 # Gera uma mensagem "estilo" de um usuário ou canal com base no historico.
 # O modelo e salvo em markov_models e reutilizado enquanto for recente.
 # https://towardsdatascience.com/text-generation-with-markov-chains-an-introduction-to-using-markovify-742e6680dc33
+import asyncio
 import json
 import logging
 import random
@@ -60,7 +61,7 @@ class Markov(commands.Cog):
         target_obj, target_type, label = resolved
         target_id = target_obj.id
 
-        model = self._load_model(ctx.guild.id, target_id, target_type)
+        model = await self._load_model(ctx.guild.id, target_id, target_type)
         if model is not None:
             log.info("Reutilizando modelo salvo do target_id=%s", target_id)
         else:
@@ -69,18 +70,17 @@ class Markov(commands.Cog):
             if corpus is None:
                 return
 
-            model = build_markov_model(corpus)
+            # Construcao e CPU-bound: roda fora do event loop.
+            model = await asyncio.to_thread(build_markov_model, corpus)
             if not model:
                 await ctx.send(
                     f"Nao foi possivel gerar um modelo com o historico de {label}."
                 )
                 return
 
-            self._save_model(ctx.guild.id, target_id, target_type, model)
+            await self._save_model(ctx.guild.id, target_id, target_type, model)
 
-        generated = generate_markov_text(
-            model, max_length=MAX_GENERATED_WORDS
-        )
+        generated = generate_markov_text(model, max_length=MAX_GENERATED_WORDS)
         await ctx.send(f"{label}:\n>>> {generated}")
 
     async def _resolve_target(self, ctx, target):
@@ -94,7 +94,7 @@ class Markov(commands.Cog):
         await ctx.send("Alvo invalido. Mencione um @usuario ou #canal.")
         return None
 
-    def _load_model(self, guild_id: int, target_id: int, target_type: str):
+    async def _load_model(self, guild_id: int, target_id: int, target_type: str):
         """
         Busca o modelo salvo no banco. Retorna o modelo se ele existir e for
         recente (menos de MODEL_MAX_AGE), senao retorna None para reconstruir.
@@ -102,10 +102,9 @@ class Markov(commands.Cog):
         try:
             sql = (
                 "SELECT model_data, created_at FROM markov_models "
-                f"WHERE guild_id = {guild_id} AND target_id = {target_id}"
-                f" AND target_type = '{target_type}'"
+                "WHERE guild_id = %s AND target_id = %s AND target_type = %s"
             )
-            result = self.pg.query(sql)
+            result = await self.pg.aquery(sql, (guild_id, target_id, target_type))
             if not result:
                 log.info("Nenhum modelo salvo encontrado para o alvo.")
                 return None
@@ -115,7 +114,9 @@ class Markov(commands.Cog):
                 log.info("Modelo salvo esta velho demais, reconstruindo.")
                 return None
 
-            model = deserialize_model(result[0]["model_data"])
+            model = await asyncio.to_thread(
+                deserialize_model, result[0]["model_data"]
+            )
             if not model:
                 log.info("Modelo salvo esta vazio, reconstruindo.")
                 return None
@@ -242,21 +243,21 @@ busca falhar ou nao houver mensagens suficientes.
         )
         return corpus
 
-    def _save_model(self, guild_id: int, target_id: int, target_type: str, model):
+    async def _save_model(self, guild_id: int, target_id: int, target_type: str, model):
         """Salva (ou atualiza) o modelo construido na tabela markov_models."""
-        serialized = serialize_model(model)
-        # Dobra as aspas simples para manter a string literal de SQL valida.
-        escaped = serialized.replace("'", "''")
+        serialized = await asyncio.to_thread(serialize_model, model)
         now = datetime.now(UTC)
 
         sql = (
             "INSERT INTO markov_models (guild_id, target_id, target_type, model_data, created_at) "
-            f"VALUES ({guild_id}, {target_id}, '{target_type}', '{escaped}', '{now.isoformat()}') "
+            "VALUES (%s, %s, %s, %s, %s) "
             "ON CONFLICT (guild_id, target_id, target_type) DO UPDATE "
             "SET model_data = EXCLUDED.model_data, created_at = EXCLUDED.created_at"
         )
         try:
-            self.pg.update(sql)
+            await self.pg.aupdate(
+                sql, (guild_id, target_id, target_type, serialized, now)
+            )
             log.info("Modelo salvo no banco de dados.")
         except Exception as e:  # noqa: BLE001 - self.pg.update ja trata erros de conexao
             log.error("Erro ao salvar modelo no banco: %s", e)
@@ -316,12 +317,13 @@ def build_markov_model(text_corpus, state_size=STATE_SIZE):
     return model
 
 
-def _generate_once(model, state_size, max_length):
+def _generate_once(model, state_size, max_length, keys=None):
     """
     Gera uma sequencia de palavras seguindo a cadeia a partir do inicio.
     Ignora a chave especial _LINES_KEY ao sortear o prefixo inicial.
     """
-    keys = [key for key in model if isinstance(key, tuple)]
+    if keys is None:
+        keys = [key for key in model if isinstance(key, tuple)]
     if not keys:
         return []
     prefix = tuple([_BEGIN] * state_size)
@@ -353,9 +355,10 @@ def generate_markov_text(
     if not model:
         return "Modelo ainda nao tem dados suficientes."
     source_lines = model.get(_LINES_KEY, frozenset())
+    keys = [key for key in model if isinstance(key, tuple)]
 
     candidates = [
-        _generate_once(model, STATE_SIZE, max_length) for _ in range(tries)
+        _generate_once(model, STATE_SIZE, max_length, keys) for _ in range(tries)
     ]
     good = [
         words

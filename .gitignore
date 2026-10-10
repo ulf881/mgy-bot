@@ -1,8 +1,19 @@
 cogs/__pycache__
 utils/__pycache__
+__pycache__/
+*.pyc
 discordBot.log
+*.log
+logs.txt
 deploy&dumps
 *.exe
 test.py
 sandbox/
 .env
+cookies.txt
+database-backup.sql
+
+# Local environment / machine-specific
+INTRUCTIONS.md
+reports/progress.md
+*.code-workspace

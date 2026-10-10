@@ -8,6 +8,7 @@ que nao exige credenciais nem contorna os bloqueios de bot do Reddit.
 
 import logging
 import random
+from urllib.parse import quote
 
 import aiohttp
 from discord.ext import commands
@@ -26,28 +27,36 @@ class Reddit(commands.Cog, name="Reddit"):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._session: aiohttp.ClientSession | None = None
+
+    async def cog_unload(self):
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+
+    def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
 
     async def _fetch_posts(self, ctx: commands.Context, subreddit: str):
         """Busca as submissoes recentes do subreddit e devolve a lista, ou None."""
-        url = PULLPUSH_URL.format(subreddit=subreddit)
+        url = PULLPUSH_URL.format(subreddit=quote(subreddit, safe=""))
         log.info("Buscando posts do Reddit: GET %s", url)
         try:
-            async with aiohttp.ClientSession() as session, session.get(
-                url, timeout=15
-            ) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        log.error(
-                            "Falha ao buscar posts do Reddit: GET %s (status %s): %s",
-                            url,
-                            resp.status,
-                            body[:200],
-                        )
-                        await ctx.send(
-                            f"Nao consegui buscar r/{subreddit} (status {resp.status})."
-                        )
-                        return None
-                    data = await resp.json()
+            async with self._get_session().get(url, timeout=15) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    log.error(
+                        "Falha ao buscar posts do Reddit: GET %s (status %s): %s",
+                        url,
+                        resp.status,
+                        body[:200],
+                    )
+                    await ctx.send(
+                        f"Nao consegui buscar r/{subreddit} (status {resp.status})."
+                    )
+                    return None
+                data = await resp.json()
         except aiohttp.ClientError as error:
             log.error("Erro ao falar com o Reddit: %s", error)
             await ctx.send("Deu erro ao falar com o Reddit. Tenta de novo?")
