@@ -4,3 +4,5 @@ discordBot.log
 deploy&dumps
 *.exe
 test.py
+sandbox/
+.env

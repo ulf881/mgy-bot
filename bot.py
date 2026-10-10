@@ -50,6 +50,10 @@ INITIAL_EXTENSIONS = [
     "cogs.level",
     "cogs.games",
     "cogs.mod",
+    "cogs.markov",
+    "cogs.reddit",
+    "cogs.r34",
+    # "cogs.alerts",
 ]
 
 intents = discord.Intents.default()

@@ -169,7 +169,12 @@ class Eventos(commands.Cog, name="Eventos"):
         elif isinstance(error, commands.MissingRequiredArgument):
             await ctx.send_help(ctx.command)
         else:
-            log.error("Erro ao executar comando, %s", error, exc_info=1)
+            original = getattr(error, "original", error)
+            log.error(
+                "Erro ao executar comando, %s",
+                error,
+                exc_info=(type(original), original, original.__traceback__),
+            )
 
 
 async def setup(bot: commands.Bot):

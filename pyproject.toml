@@ -18,6 +18,7 @@ dependencies = [
     "python-dotenv==1.1.1",
     "requests==2.34.2",
     "spotipy==2.26.0",
+    "tzdata>=2026.5",
     "yt-dlp-ejs>=0.8.0",
     "yt-dlp[default]>=2026.8.30.232658.dev0",
 ]
@@ -28,3 +29,10 @@ mgy-bot = "mgy_bot:main"
 [build-system]
 requires = ["uv_build>=0.12.13,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "flake8>=7.4.1",
+    "pytest>=9.1.1",
+    "ruff>=0.17.0",
+]

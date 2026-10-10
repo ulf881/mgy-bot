@@ -543,7 +543,7 @@ class Music(commands.Cog):
 
     async def randomizequeue(self, ctx: commands.Context):
         """Aleatoariza a queue menos a primeira posicao"""
-        if ctx.voice_client.is_playing():
+        if ctx.voice_client.is_playing() and self.queue[ctx.guild.id]:
             temp = self.queue[ctx.guild.id].pop(0)
             random.shuffle(self.queue[ctx.guild.id])
             self.queue[ctx.guild.id].insert(0, temp)
@@ -832,7 +832,11 @@ class Music(commands.Cog):
                 if int(args[0]) > 0:
                     volume = int(args[0])
 
-        if self.queue[ctx.guild.id][0] == "https://www.youtube.com/watch?v=Tu5-h4Ye0J0":
+        if (
+            self.queue[ctx.guild.id]
+            and self.queue[ctx.guild.id][0]
+            == "https://www.youtube.com/watch?v=Tu5-h4Ye0J0"
+        ):
             ctx.voice_client.source.volume = sys.float_info.max
             await ctx.send("Lmao")
         else:
@@ -1003,7 +1007,8 @@ class Music(commands.Cog):
         if ctx.voice_client.is_playing():
             # Se for garagem da vizinha nao permite mudar o volume
             if (
-                self.queue[ctx.guild.id][0]
+                self.queue[ctx.guild.id]
+                and self.queue[ctx.guild.id][0]
                 == "https://www.youtube.com/watch?v=Tu5-h4Ye0J0"
             ):
                 ctx.voice_client.source.volume = sys.float_info.max
@@ -1028,7 +1033,11 @@ class Music(commands.Cog):
         """
 
         # nao permite dar skip na garagem da vizinha
-        if self.queue[ctx.guild.id][0] == "https://www.youtube.com/watch?v=Tu5-h4Ye0J0":
+        if (
+            self.queue[ctx.guild.id]
+            and self.queue[ctx.guild.id][0]
+            == "https://www.youtube.com/watch?v=Tu5-h4Ye0J0"
+        ):
             ctx.voice_client.source.volume = sys.float_info.max
             await ctx.send("Lmao")
             return

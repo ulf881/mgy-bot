@@ -385,3 +385,12 @@ ALTER TABLE ONLY public.usuarios
 -- PostgreSQL database dump complete
 --
 
+
+CREATE TABLE IF NOT EXISTS markov_models (
+    guild_id BIGINT NOT NULL,
+    target_id BIGINT NOT NULL,
+    target_type TEXT NOT NULL,
+    model_data TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    PRIMARY KEY (guild_id, target_id, target_type)
+);
