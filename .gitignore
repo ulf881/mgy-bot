@@ -6,3 +6,4 @@ deploy&dumps
 test.py
 sandbox/
 .env
+cookies.txt
