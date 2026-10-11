@@ -248,8 +248,10 @@ async def _extract_info_isolated(url: str, timeout: float = YTDLP_EXTRACT_TIMEOU
     ]
     if os.path.exists(COOKIES_FILE):
         command.extend(["--cookies", COOKIES_FILE])
-    for runtime in YTDLP_JS_RUNTIMES:
-        command.extend(["--js-runtimes", runtime])
+    if YTDLP_JS_RUNTIMES:
+        command.append("--no-js-runtimes")
+        for runtime in YTDLP_JS_RUNTIMES:
+            command.extend(["--js-runtimes", runtime])
     command.append(url)
 
     process = await asyncio.create_subprocess_exec(
