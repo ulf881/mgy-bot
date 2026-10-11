@@ -31,7 +31,8 @@ YTDLP_SLOW_STARTUP_SECONDS = 10
 FFMPEG_SLOW_STARTUP_SECONDS = 5
 YTDLP_EXTRACT_TIMEOUT_SECONDS = 45
 
-# Define YTDLP_DEBUG=1 no ambiente para transmitir o log verbose do yt-dlp
+# Define YTDLP_DEBUG=1 no ambiente para incluir tambem as linhas [debug]
+# do yt-dlp no log (o --verbose ja e sempre usado para manter o stdout limpo)
 YTDLP_DEBUG = os.environ.get("YTDLP_DEBUG", "").strip().lower() in {
     "1",
     "true",
@@ -190,10 +191,10 @@ def _log_ffmpeg_headers(label: str, url: str, headers: dict):
 async def _extract_info_isolated(url: str):
     """Extract metadata in a killable process so yt-dlp cannot block the bot.
 
-    O stderr do yt-dlp é lido em tempo real e registrado no log (busca,
-    download, avisos). Em caso de timeout ou erro as últimas linhas também
-    são registradas. Defina YTDLP_DEBUG=1 no ambiente para rodar com
-    --verbose e incluir as linhas [debug].
+    --verbose é sempre usado para forçar o yt-dlp a enviar as mensagens para
+    o stderr, deixando o stdout apenas com o JSON (sem --quiet o yt-dlp
+    misturaria as mensagens no stdout e corromperia o JSON). As linhas
+    [debug] são filtradas a menos que YTDLP_DEBUG esteja definido.
     """
     command = [
         sys.executable,
@@ -213,9 +214,8 @@ async def _extract_info_isolated(url: str):
         ytdl_format_options["source_address"],
         "--extractor-args",
         "youtube:player_client=" + ",".join(YOUTUBE_PLAYER_CLIENTS),
+        "--verbose",
     ]
-    if YTDLP_DEBUG:
-        command.append("--verbose")
     if IF_NOT_EXISTS:
         command.extend(["--cookies", COOKIES_FILE])
     if YTDLP_JS_RUNTIMES:
@@ -256,7 +256,11 @@ async def _extract_info_isolated(url: str):
             if not line:
                 continue
             stderr_lines.append(line)
-            log.info("yt-dlp [%s] %s", url, line)
+            # Filtra as linhas [debug] do --verbose a menos que YTDLP_DEBUG
+            if line.startswith("[debug]") and not YTDLP_DEBUG:
+                log.debug("yt-dlp [%s] %s", url, line)
+            else:
+                log.info("yt-dlp [%s] %s", url, line)
 
     stdout_task = asyncio.create_task(_drain_stdout(process.stdout))
     stderr_task = asyncio.create_task(_drain_stderr(process.stderr))
@@ -296,6 +300,13 @@ async def _extract_info_isolated(url: str):
     try:
         return json.loads(stdout.decode(errors="replace"))
     except json.JSONDecodeError as exc:
+        raw = stdout.decode(errors="replace")
+        log.error(
+            "yt-dlp returned invalid JSON for %s (%d bytes de stdout):\n%s",
+            url,
+            len(raw),
+            raw[:2000],
+        )
         raise RuntimeError("yt-dlp returned invalid JSON") from exc
 
 
