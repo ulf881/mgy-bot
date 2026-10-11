@@ -31,6 +31,14 @@ YTDLP_SLOW_STARTUP_SECONDS = 10
 FFMPEG_SLOW_STARTUP_SECONDS = 5
 YTDLP_EXTRACT_TIMEOUT_SECONDS = 45
 
+# Define YTDLP_DEBUG=1 no ambiente para transmitir o log verbose do yt-dlp
+YTDLP_DEBUG = os.environ.get("YTDLP_DEBUG", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
 COOKIES_FILE = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "cookies.txt")
 )
@@ -180,7 +188,12 @@ def _log_ffmpeg_headers(label: str, url: str, headers: dict):
 
 
 async def _extract_info_isolated(url: str):
-    """Extract metadata in a killable process so yt-dlp cannot block the bot."""
+    """Extract metadata in a killable process so yt-dlp cannot block the bot.
+
+    O stderr do yt-dlp é lido em tempo real. Em caso de timeout ou erro as
+    últimas linhas são registradas para diagnóstico. Defina YTDLP_DEBUG=1 no
+    ambiente para rodar com --verbose e ver todo o log no console.
+    """
     command = [
         sys.executable,
         "-m",
@@ -188,8 +201,6 @@ async def _extract_info_isolated(url: str):
         "--dump-single-json",
         "--skip-download",
         "--no-playlist",
-        "--quiet",
-        "--no-warnings",
         "--no-check-certificates",
         "--default-search",
         "auto",
@@ -202,6 +213,10 @@ async def _extract_info_isolated(url: str):
         "--extractor-args",
         "youtube:player_client=" + ",".join(YOUTUBE_PLAYER_CLIENTS),
     ]
+    if YTDLP_DEBUG:
+        command.append("--verbose")
+    else:
+        command.extend(["--quiet", "--no-warnings"])
     if IF_NOT_EXISTS:
         command.extend(["--cookies", COOKIES_FILE])
     if YTDLP_JS_RUNTIMES:
@@ -215,19 +230,65 @@ async def _extract_info_isolated(url: str):
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+
+    stdout_chunks: List[bytes] = []
+    stderr_lines: List[str] = []
+
+    async def _read_stream(stream, on_line):
+        if stream is None:
+            return
+        while True:
+            raw = await stream.readline()
+            if not raw:
+                break
+            on_line(raw)
+
+    def _on_stdout(raw: bytes):
+        stdout_chunks.append(raw)
+
+    def _on_stderr(raw: bytes):
+        line = raw.decode(errors="replace").rstrip()
+        if not line:
+            return
+        stderr_lines.append(line)
+        if YTDLP_DEBUG:
+            log.info("yt-dlp [%s] %s", url, line)
+        else:
+            log.debug("yt-dlp [%s] %s", url, line)
+
+    stdout_task = asyncio.create_task(_read_stream(process.stdout, _on_stdout))
+    stderr_task = asyncio.create_task(_read_stream(process.stderr, _on_stderr))
+
+    def _stderr_tail(limit: int = 50) -> str:
+        return "\n".join(stderr_lines[-limit:]) or "(sem saída do yt-dlp)"
+
     try:
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(), timeout=YTDLP_EXTRACT_TIMEOUT_SECONDS
-        )
+        await asyncio.wait_for(process.wait(), timeout=YTDLP_EXTRACT_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
         process.kill()
         await process.wait()
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        log.error(
+            "yt-dlp timed out after %ss for %s. Últimas linhas:\n%s",
+            YTDLP_EXTRACT_TIMEOUT_SECONDS,
+            url,
+            _stderr_tail(),
+        )
         raise TimeoutError(
             f"yt-dlp extraction timed out after {YTDLP_EXTRACT_TIMEOUT_SECONDS}s"
         )
 
+    await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+    stdout = b"".join(stdout_chunks)
+
     if process.returncode != 0:
-        error = stderr.decode(errors="replace").strip()
+        error = _stderr_tail()
+        log.error(
+            "yt-dlp exited with %s for %s. Últimas linhas:\n%s",
+            process.returncode,
+            url,
+            error,
+        )
         raise RuntimeError(error or f"yt-dlp exited with {process.returncode}")
 
     try:
