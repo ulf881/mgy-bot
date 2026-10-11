@@ -53,6 +53,15 @@ VOICE_CONNECT_ATTEMPTS = 3
 VOICE_RECONNECT_DELAY_SECONDS = 2.0
 MAX_RESOLVE_ATTEMPTS = 10
 MASHUP_SCAN_LIMIT = 100
+# Validade das stream URLs: lemos o vencimento exato do campo "expire" que o
+# proprio googlevideo embute na URL. A idade maxima so e usada como fallback
+# quando a URL nao expoe o vencimento.
+YTDLP_URL_EXPIRY_MARGIN_SECONDS = 120
+YTDLP_URL_MAX_AGE_SECONDS = 4 * 60 * 60
+# Se o player terminar com erro logo no comeco, a URL provavelmente expirou:
+# tenta UMA re-resolucao da mesma faixa antes de pular para a proxima.
+PLAYBACK_START_THRESHOLD_SECONDS = 8
+PLAYBACK_MAX_RETRIES = 1
 
 # Define YTDLP_DEBUG=1 no ambiente para incluir tambem as linhas [debug]
 # do yt-dlp no log (o --verbose ja e sempre usado para manter o stdout limpo)
@@ -147,6 +156,11 @@ class Track:
     webpage_url: str | None = None
     duration: float | None = None
     data: dict | None = None
+    # Instante (time.monotonic) em que a faixa foi resolvida; fallback de
+    # validade quando a URL nao traz "expire".
+    resolved_at: float | None = None
+    # Quantas vezes essa faixa ja foi re-resolvida por falha ao comecar.
+    retries: int = 0
 
     def display_name(self) -> str:
         """Nome para exibir em listas, sem resolver novamente."""
@@ -179,6 +193,42 @@ class GuildPlayer:
     reconnect_task: asyncio.Task | None = None
     # Identifica o player atual; callbacks "after" antigos sao descartados.
     play_generation: int = 0
+
+
+def _url_expires_at(url: str) -> float | None:
+    """Epoch (s) em que a URL expira, lendo o campo 'expire' da query string.
+
+    As URLs diretas do googlevideo (e manifests) embutem "expire=<epoch>" no
+    query string. Raramente o valor vem em milissegundos; normaliza aqui.
+    Retorna None quando nao e possivel saber o vencimento.
+    """
+    values = parse_qs(urlparse(url).query).get("expire")
+    if not values:
+        return None
+    try:
+        value = float(values[-1])
+    except (TypeError, ValueError):
+        return None
+    if value > 1e12:  # parece milissegundos
+        value /= 1000.0
+    return value
+
+
+def _is_track_fresh(track: Track) -> bool:
+    """True se o stream_url ainda e confiavel para tocar.
+
+    Usa o vencimento exato embutido na URL ('expire') com uma pequena margem
+    de seguranca. Sem o campo, cai para a idade maxima baseada em resolved_at.
+    """
+    if not track.stream_url:
+        return False
+    expires = _url_expires_at(track.stream_url)
+    if expires is not None:
+        return time.time() + YTDLP_URL_EXPIRY_MARGIN_SECONDS < expires
+    return (
+        track.resolved_at is not None
+        and time.monotonic() - track.resolved_at <= YTDLP_URL_MAX_AGE_SECONDS
+    )
 
 
 _cookie_cache = {"mtime": None, "value": ""}
@@ -494,8 +544,11 @@ class Music(commands.Cog):
         abort_event: asyncio.Event | None = None,
     ) -> Track | None:
         """Resolve uma Track via yt-dlp. Retorna None em caso de falha."""
-        if track.stream_url:
+        if _is_track_fresh(track):
             return track
+        if track.stream_url:
+            log.info("Stream URL de '%s' expirou; resolvendo novamente", track.query)
+            track.stream_url = None
 
         started_at = time.monotonic()
         try:
@@ -520,6 +573,7 @@ class Music(commands.Cog):
         track.duration = data.get("duration")
         track.stream_url = data.get("url")
         track.webpage_url = data.get("original_url") or track.webpage_url
+        track.resolved_at = time.monotonic()
 
         elapsed = time.monotonic() - started_at
         if elapsed >= YTDLP_SLOW_STARTUP_SECONDS:
@@ -699,7 +753,7 @@ class Music(commands.Cog):
     def _schedule_prefetch(self, guild_id: int, state: GuildPlayer):
         """Resolve a proxima faixa em segundo plano para esconder a latencia."""
         self._cancel_prefetch(state)
-        if not state.queue or state.queue[0].stream_url:
+        if not state.queue or _is_track_fresh(state.queue[0]):
             return
         state.prefetch_task = asyncio.create_task(self._prefetch_next(guild_id, state))
 
@@ -708,7 +762,7 @@ class Music(commands.Cog):
         if not state.queue:
             return
         track = state.queue[0]
-        if track.stream_url:
+        if _is_track_fresh(track):
             return
         try:
             resolved = await self._resolve_track(track)
@@ -786,17 +840,23 @@ class Music(commands.Cog):
             if error:
                 log.error("Player da guild %s terminou com erro: %s", guild_id, error)
             asyncio.run_coroutine_threadsafe(
-                self._on_track_end(guild_id, generation), self.bot.loop
+                self._on_track_end(guild_id, generation, error), self.bot.loop
             )
 
         return after
 
-    async def _on_track_end(self, guild_id: int, generation: int | None = None):
+    async def _on_track_end(
+        self, guild_id: int, generation: int | None = None, error=None
+    ):
         """Avanca a fila quando uma musica termina (unico cleanup automatico).
 
         ``generation`` identifica o player que disparou o callback. Callbacks
         obsoletos (de uma conexao que caiu, por exemplo) sao ignorados para nao
         interromper a faixa que acabou de comecar apos uma reconexao.
+
+        Se o player terminar com erro logo no comeco (antes de
+        PLAYBACK_START_THRESHOLD_SECONDS), a URL provavelmente expirou: tenta-se
+        UMA re-resolucao da mesma faixa antes de avancar para a proxima.
         """
         state = self._state(guild_id)
         async with state.lock:
@@ -808,6 +868,29 @@ class Music(commands.Cog):
                     state.play_generation,
                 )
                 return
+            failed = state.current
+            if error is not None and failed is not None:
+                elapsed = (
+                    time.monotonic() - state.started_at if state.started_at else 0.0
+                )
+                if (
+                    elapsed < PLAYBACK_START_THRESHOLD_SECONDS
+                    and failed.retries < PLAYBACK_MAX_RETRIES
+                ):
+                    log.warning(
+                        "Faixa '%s' falhou ao comecar (%.1fs, %s); re-resolvendo (guild=%s)",
+                        failed.query,
+                        elapsed,
+                        error,
+                        guild_id,
+                    )
+                    failed.retries += 1
+                    failed.stream_url = None
+                    failed.resolved_at = None
+                    state.queue.insert(0, failed)
+                    state.current = None
+                    await self._advance_locked(guild_id, state)
+                    return
             state.current = None
             await self._advance_locked(guild_id, state)
 

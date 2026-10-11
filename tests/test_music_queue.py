@@ -3,6 +3,7 @@
 import asyncio
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -11,6 +12,20 @@ os.environ.setdefault("SPOTIPY_CLIENT_SECRET", "test-secret")
 os.environ.setdefault("YOUTUBE_API_KEY", "test-key")
 
 from cogs import music
+
+
+def _fake_resolved(track, **kwargs):
+    """Simula uma resolucao yt-dlp: URL valida com 'expire' no futuro."""
+    track.stream_url = (
+        "https://cdn.example.com/video?expire=%d" % (int(time.time()) + 3600)
+    )
+    track.resolved_at = time.monotonic()
+    track.title = track.query
+    return track
+
+
+async def _fake_resolve(track, **kwargs):
+    return _fake_resolved(track, **kwargs)
 
 
 class DummyPostgres:
@@ -122,12 +137,7 @@ def test_advance_plays_next_and_keeps_queue(monkeypatch):
     state.voice = FakeVoice()
     state.queue = [music.Track("first"), music.Track("second")]
 
-    async def fake_resolve(track, **kwargs):
-        track.stream_url = "stream"
-        track.title = track.query
-        return track
-
-    cog._resolve_track = fake_resolve
+    cog._resolve_track = _fake_resolve
     cog._build_source = lambda track, state, extra_before="": FakeSource()
 
     asyncio.run(cog._advance_locked(1, state))
@@ -147,9 +157,7 @@ def test_resolve_failure_skips_to_next(monkeypatch):
     async def fake_resolve(track, **kwargs):
         if track.query == "bad":
             return None
-        track.stream_url = "stream"
-        track.title = track.query
-        return track
+        return _fake_resolved(track, **kwargs)
 
     cog._resolve_track = fake_resolve
     cog._build_source = lambda track, state, extra_before="": FakeSource()
@@ -167,12 +175,7 @@ def test_on_track_end_advances_queue(monkeypatch):
     state.current = music.Track("current")
     state.queue = [music.Track("next")]
 
-    async def fake_resolve(track, **kwargs):
-        track.stream_url = "stream"
-        track.title = track.query
-        return track
-
-    cog._resolve_track = fake_resolve
+    cog._resolve_track = _fake_resolve
     cog._build_source = lambda track, state, extra_before="": FakeSource()
 
     asyncio.run(cog._on_track_end(1))
@@ -286,3 +289,108 @@ def test_sync_voice_adopts_real_client(monkeypatch):
     assert cog._sync_voice(state, FakeGuild()) is True
     assert state.voice is real
     assert state.voice_channel == "canal"
+
+
+def test_url_expires_at_parses_expire(monkeypatch):
+    assert music._url_expires_at("https://cdn.example.com/v?expire=4102444800") == 4102444800.0
+    assert music._url_expires_at("https://cdn.example.com/v?expire=4102444800000") == 4102444800.0
+    assert music._url_expires_at("https://cdn.example.com/v?expire=abc") is None
+    assert music._url_expires_at("https://cdn.example.com/v") is None
+
+
+def test_is_track_fresh_uses_expire_or_age(monkeypatch):
+    future = "https://cdx.example.com/v?expire=%d" % (int(time.time()) + 3600)
+    past = "https://cdx.example.com/v?expire=%d" % (int(time.time()) - 60)
+
+    assert music._is_track_fresh(music.Track("a", stream_url=future)) is True
+    assert music._is_track_fresh(music.Track("a", stream_url=past)) is False
+    assert music._is_track_fresh(music.Track("a")) is False
+
+    # Sem "expire", usa a idade maxima como fallback.
+    fresh = music.Track("a", stream_url="https://c/v")
+    fresh.resolved_at = time.monotonic()
+    stale = music.Track("a", stream_url="https://c/v")
+    stale.resolved_at = time.monotonic() - music.YTDLP_URL_MAX_AGE_SECONDS - 1
+    assert music._is_track_fresh(fresh) is True
+    assert music._is_track_fresh(stale) is False
+
+
+def test_resolve_track_reuses_fresh_url(monkeypatch):
+    cog = make_cog(monkeypatch)
+    track = music.Track("song")
+    track.stream_url = (
+        "https://c.example.com/v?expire=%d" % (int(time.time()) + 3600)
+    )
+    track.resolved_at = time.monotonic()
+
+    calls = []
+
+    async def boom(*args, **kwargs):
+        calls.append(1)
+        raise AssertionError("nao deveria re-resolver")
+
+    monkeypatch.setattr(music, "_extract_info_isolated", boom)
+
+    asyncio.run(cog._resolve_track(track))
+
+    assert calls == []
+    assert track.stream_url is not None
+
+
+def test_resolve_track_refreshes_stale_url(monkeypatch):
+    cog = make_cog(monkeypatch)
+    track = music.Track("song")
+    track.stream_url = "https://c.example.com/v?expire=%d" % (int(time.time()) - 60)
+    track.resolved_at = time.monotonic()
+
+    async def fake_extract(query, idle_timeout, max_timeout, abort_event):
+        return {"url": "https://campo.example.com/v?expire=%d" % (int(time.time()) + 3600), "title": "nova"}
+
+    monkeypatch.setattr(music, "_extract_info_isolated", fake_extract)
+
+    asyncio.run(cog._resolve_track(track))
+
+    assert "campo.example.com" in track.stream_url
+    assert track.title == "nova"
+    assert track.resolved_at is not None
+
+
+def test_on_track_end_retries_once_on_early_error(monkeypatch):
+    cog = make_cog(monkeypatch)
+    state = cog._state(1)
+    state.voice = FakeVoice()
+    state.current = music.Track("fail")
+    state.current.stream_url = "https://c.example.com/v?expire=%d" % (int(time.time()) + 3600)
+    state.current.resolved_at = time.monotonic()
+    state.queue = [music.Track("next")]
+
+    cog._resolve_track = _fake_resolve
+    cog._build_source = lambda track, state, extra_before="": FakeSource()
+
+    asyncio.run(cog._on_track_end(1, error=Exception("boom")))
+
+    assert state.current.query == "fail"  # re-resolvida e tocada de novo
+    assert state.current.retries == 1
+    assert [t.query for t in state.queue] == ["next"]
+
+    # Segunda falha no comeco: retries esgotado, avanca para a proxima.
+    asyncio.run(cog._on_track_end(1, error=Exception("boom")))
+    assert state.current.query == "next"
+    assert state.queue == []
+
+
+def test_on_track_end_no_retry_when_played_long(monkeypatch):
+    cog = make_cog(monkeypatch)
+    state = cog._state(1)
+    state.voice = FakeVoice()
+    state.current = music.Track("long")
+    state.started_at = time.monotonic() - music.PLAYBACK_START_THRESHOLD_SECONDS - 1
+    state.queue = [music.Track("next")]
+
+    cog._resolve_track = _fake_resolve
+    cog._build_source = lambda track, state, extra_before="": FakeSource()
+
+    asyncio.run(cog._on_track_end(1, error=Exception("boom")))
+
+    assert state.current.query == "next"
+    assert state.queue == []
