@@ -1208,24 +1208,26 @@ class Music(commands.Cog):
         -shuffle - ordem aleatoria
         -n - numero de repetições
         """
+        state = self._state(ctx.guild.id)
         async with ctx.typing():
-            self._state(ctx.guild.id).now_playing = None
+            state.now_playing = None
             added = await self._parse_and_enqueue(ctx, url, args)
 
             if "-shuffle" in args:
                 await self.randomizequeue(ctx)
 
-        state = self._state(ctx.guild.id)
-        if state.voice and (state.voice.is_playing() or state.voice.is_paused()):
-            log.info("Esta tocando, adicionando a queue")
-            position = 1 if "-f" in args else len(state.queue) - 1
-            await ctx.send(f"```Adicionado à fila, posição: {position}```")
-        else:
-            log.info("Nao esta tocando, comecando agora")
-            if added == 0:
-                await ctx.send("```Fila cheia```")
-                return
-            await self.tocar(ctx)
+            if state.voice and (state.voice.is_playing() or state.voice.is_paused()):
+                log.info("Esta tocando, adicionando a queue")
+                position = 1 if "-f" in args else len(state.queue) - 1
+                await ctx.send(f"```Adicionado à fila, posição: {position}```")
+            else:
+                log.info("Nao esta tocando, comecando agora")
+                if added == 0:
+                    await ctx.send("```Fila cheia```")
+                    return
+                # A resolucao da primeira faixa (yt-dlp) acontece dentro do
+                # typing para o usuario ver que o bot ainda esta trabalhando.
+                await self.tocar(ctx)
 
     @commands.command(aliases=["paus", "pau"])
     async def pause(self, ctx: commands.Context):
