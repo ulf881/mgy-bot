@@ -1418,15 +1418,17 @@ class Music(commands.Cog):
         quan = min(quan, MAX_QUEUE)
 
         tracks = [Track(BONUS_ROOM_URL) for _ in range(quan)]
-        await self._enqueue(state, tracks, front=False)
-        await self.randomizequeue(ctx)
+        async with ctx.typing():
+            await self._enqueue(state, tracks, front=False)
+            await self.randomizequeue(ctx)
 
-        if state.voice and (state.voice.is_playing() or state.voice.is_paused()):
-            await ctx.send(
-                f"```Adicionado {quan} Bonus Room à lista. Total na lista: {len(state.queue)}```"
-            )
-        else:
-            await self.tocar(ctx)
+            if state.voice and (state.voice.is_playing() or state.voice.is_paused()):
+                await ctx.send(
+                    f"```Adicionado {quan} Bonus Room à lista. Total na lista: {len(state.queue)}```"
+                )
+            else:
+                # A resolucao da primeira faixa fica dentro do typing.
+                await self.tocar(ctx)
 
     @commands.command(aliases=["t", "tocar"])
     async def toca(self, ctx: commands.Context, name: str, *args):
@@ -1454,17 +1456,19 @@ class Music(commands.Cog):
         url = resultado[0]["url"]
         state = self._state(ctx.guild.id)
         state.channel = ctx.channel
-        await self._parse_and_enqueue(ctx, url, args)
+        async with ctx.typing():
+            await self._parse_and_enqueue(ctx, url, args)
 
-        if "-shuffle" in args:
-            await self.randomizequeue(ctx)
+            if "-shuffle" in args:
+                await self.randomizequeue(ctx)
 
-        if state.voice and (state.voice.is_playing() or state.voice.is_paused()):
-            await ctx.send(
-                f"```Adicionado {resultado[0]['name']} à lista. Total na lista: {len(state.queue)}```"
-            )
-        else:
-            await self.tocar(ctx)
+            if state.voice and (state.voice.is_playing() or state.voice.is_paused()):
+                await ctx.send(
+                    f"```Adicionado {resultado[0]['name']} à lista. Total na lista: {len(state.queue)}```"
+                )
+            else:
+                # A resolucao da primeira faixa fica dentro do typing.
+                await self.tocar(ctx)
 
     @commands.command()
     async def add(self, ctx: commands.Context, name: str, url: str):
