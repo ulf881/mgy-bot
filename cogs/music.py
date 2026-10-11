@@ -50,6 +50,12 @@ BROWSER_HEADERS = {
 
 YOUTUBE_PLAYER_CLIENTS = ["web_embedded", "web", "tv", "mweb"]
 
+YTDLP_JS_RUNTIMES = [
+    runtime.strip()
+    for runtime in os.environ.get("YTDLP_JS_RUNTIMES", "").split(",")
+    if runtime.strip()
+]
+
 # Inicia o logger
 log = logging.getLogger("music")
 
@@ -198,6 +204,8 @@ async def _extract_info_isolated(url: str):
     ]
     if IF_NOT_EXISTS:
         command.extend(["--cookies", COOKIES_FILE])
+    for runtime in YTDLP_JS_RUNTIMES:
+        command.extend(["--js-runtimes", runtime])
     command.append(url)
 
     process = await asyncio.create_subprocess_exec(
