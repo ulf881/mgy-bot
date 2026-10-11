@@ -39,10 +39,29 @@ from utils.pgdatabase import Postgres
 
 YTDLP_SLOW_STARTUP_SECONDS = 10
 FFMPEG_SLOW_STARTUP_SECONDS = 5
-YTDLP_EXTRACT_TIMEOUT_SECONDS = 45
-YTDLP_PREFETCH_TIMEOUT_SECONDS = 180
+# Timeout por inatividade: se o yt-dlp ficar sem emitir nenhuma linha por esse
+# tempo, consideramos que travou e o processo e morto. Enquanto ele continua
+# progredindo (imprimindo linhas de log), o contador reinicia.
+YTDLP_IDLE_TIMEOUT_SECONDS = 60
+# Teto absoluto de seguranca, mesmo que o yt-dlp continue imprimindo saida.
+YTDLP_MAX_TIMEOUT_SECONDS = 900
+# Intervalo de checagem do yt-dlp: curto para reagir rapido a skip/stop
+# (abort) e para medir a inatividade com precisao.
+YTDLP_POLL_INTERVAL_SECONDS = 1.0
+# Reconexao de voz: quantas tentativas e quanto esperar entre elas.
+VOICE_CONNECT_ATTEMPTS = 3
+VOICE_RECONNECT_DELAY_SECONDS = 2.0
 MAX_RESOLVE_ATTEMPTS = 10
 MASHUP_SCAN_LIMIT = 100
+
+# Define YTDLP_DEBUG=1 no ambiente para incluir tambem as linhas [debug]
+# do yt-dlp no log (o --verbose ja e sempre usado para manter o stdout limpo)
+YTDLP_DEBUG = os.environ.get("YTDLP_DEBUG", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 COOKIES_FILE = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "cookies.txt")
@@ -52,6 +71,10 @@ DROPBOX_FILE = os.path.abspath(
 )
 
 log = logging.getLogger("music")
+
+
+class ResolutionAborted(Exception):
+    """Levantada quando skip/stop cancela uma resolucao yt-dlp em andamento."""
 
 
 BROWSER_HEADERS = {
@@ -65,7 +88,7 @@ BROWSER_HEADERS = {
     "Origin": "https://www.youtube.com",
 }
 
-YOUTUBE_PLAYER_CLIENTS = ["web_embedded", "web", "tv", "mweb"]
+YOUTUBE_PLAYER_CLIENTS = ["web_embedded", "web"]
 
 YTDLP_JS_RUNTIMES = [
     runtime.strip()
@@ -137,6 +160,7 @@ class GuildPlayer:
     queue: list[Track] = field(default_factory=list)
     current: Track | None = None
     voice: discord.VoiceClient | None = None
+    voice_channel: discord.VoiceChannel | None = None
     channel: discord.abc.Messageable | None = None
     now_playing: discord.Message | None = None
     volume: float = 0.5
@@ -144,6 +168,17 @@ class GuildPlayer:
     started_at: float = 0.0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     prefetch_task: asyncio.Task | None = None
+    # Sinaliza para uma resolucao yt-dlp em andamento que ela deve parar
+    # (setado por skip/stop; limpo quando um novo avanco comeca).
+    abort_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # True enquanto _advance_locked esta resolvendo uma faixa (yt-dlp).
+    resolving: bool = False
+    # True enquanto uma reconexao de voz esta em andamento.
+    reconnecting: bool = False
+    # Task de reconexao (mantida viva para nao ser coletada pelo GC).
+    reconnect_task: asyncio.Task | None = None
+    # Identifica o player atual; callbacks "after" antigos sao descartados.
+    play_generation: int = 0
 
 
 _cookie_cache = {"mtime": None, "value": ""}
@@ -223,8 +258,27 @@ def _build_ffmpeg_headers(data: dict) -> dict:
     return headers
 
 
-async def _extract_info_isolated(url: str, timeout: float = YTDLP_EXTRACT_TIMEOUT_SECONDS) -> dict:
-    """Extrai metadados em um subprocesso que pode ser morto sem travar o bot."""
+async def _extract_info_isolated(
+    url: str,
+    idle_timeout: float = YTDLP_IDLE_TIMEOUT_SECONDS,
+    max_timeout: float | None = YTDLP_MAX_TIMEOUT_SECONDS,
+    abort_event: asyncio.Event | None = None,
+) -> dict:
+    """Extrai metadados em um subprocesso que pode ser morto sem travar o bot.
+
+    O timeout e por inatividade: o processo so e morto se ficar ``idle_timeout``
+    segundos sem emitir nenhuma linha de log. Enquanto ele continua progredindo
+    o cronometro reinicia, permitindo extracoes lentas mas vivas. ``max_timeout``
+    e um teto absoluto de seguranca (``None`` desativa).
+
+    Se ``abort_event`` for setado (por skip/stop), o subprocesso e morto e
+    :class:`ResolutionAborted` e levantada.
+
+    --verbose e sempre usado para forcar o yt-dlp a enviar as mensagens para
+    o stderr, deixando o stdout apenas com o JSON (sem --quiet o yt-dlp
+    misturaria as mensagens no stdout e corromperia o JSON). As linhas
+    [debug] sao filtradas a menos que YTDLP_DEBUG esteja definido.
+    """
     command = [
         sys.executable,
         "-m",
@@ -232,8 +286,6 @@ async def _extract_info_isolated(url: str, timeout: float = YTDLP_EXTRACT_TIMEOU
         "--dump-single-json",
         "--skip-download",
         "--no-playlist",
-        "--quiet",
-        "--no-warnings",
         "--no-check-certificates",
         "--default-search",
         "auto",
@@ -245,6 +297,7 @@ async def _extract_info_isolated(url: str, timeout: float = YTDLP_EXTRACT_TIMEOU
         ytdl_format_options["source_address"],
         "--extractor-args",
         "youtube:player_client=" + ",".join(YOUTUBE_PLAYER_CLIENTS),
+        "--verbose",
     ]
     if os.path.exists(COOKIES_FILE):
         command.extend(["--cookies", COOKIES_FILE])
@@ -258,28 +311,130 @@ async def _extract_info_isolated(url: str, timeout: float = YTDLP_EXTRACT_TIMEOU
         *command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=1024 * 1024,
     )
+
+    stdout_chunks: list[bytes] = []
+    stderr_lines: list[str] = []
+    last_activity = time.monotonic()
+
+    async def _drain_stdout(stream):
+        # Le em blocos: o JSON de --dump-single-json e uma unica linha enorme,
+        # entao readline() estouraria o limite do StreamReader.
+        nonlocal last_activity
+        if stream is None:
+            return
+        while True:
+            chunk = await stream.read(65536)
+            if not chunk:
+                break
+            stdout_chunks.append(chunk)
+            last_activity = time.monotonic()
+
+    async def _drain_stderr(stream):
+        nonlocal last_activity
+        if stream is None:
+            return
+        while True:
+            raw = await stream.readline()
+            if not raw:
+                break
+            last_activity = time.monotonic()
+            line = raw.decode(errors="replace").rstrip()
+            if not line:
+                continue
+            stderr_lines.append(line)
+            # Filtra as linhas [debug] do --verbose a menos que YTDLP_DEBUG
+            if line.startswith("[debug]") and not YTDLP_DEBUG:
+                log.debug("yt-dlp [%s] %s", url, line)
+            else:
+                log.info("yt-dlp [%s] %s", url, line)
+
+    stdout_task = asyncio.create_task(_drain_stdout(process.stdout))
+    stderr_task = asyncio.create_task(_drain_stderr(process.stderr))
+    wait_task = asyncio.create_task(process.wait())
+
+    def _stderr_tail(limit: int = 50) -> str:
+        return "\n".join(stderr_lines[-limit:]) or "(sem saida do yt-dlp)"
+
+    timeout_reason: str | None = None
+    aborted = False
     try:
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(), timeout=timeout
-        )
+        started = time.monotonic()
+        while True:
+            if abort_event is not None and abort_event.is_set():
+                aborted = True
+                break
+
+            now = time.monotonic()
+            idle_left = idle_timeout - (now - last_activity)
+            if idle_left <= 0:
+                timeout_reason = f"sem saida por {idle_timeout:.0f}s"
+                break
+
+            wait_budget = min(idle_left, YTDLP_POLL_INTERVAL_SECONDS)
+            if max_timeout is not None:
+                max_left = max_timeout - (now - started)
+                if max_left <= 0:
+                    timeout_reason = f"tempo maximo de {max_timeout:.0f}s"
+                    break
+                wait_budget = min(wait_budget, max_left)
+
+            try:
+                await asyncio.wait_for(asyncio.shield(wait_task), timeout=wait_budget)
+                break
+            except TimeoutError:
+                # Sem saida dentro da janela: reavalia progresso/abort.
+                continue
     except asyncio.CancelledError:
         process.kill()
+        wait_task.cancel()
+        stdout_task.cancel()
+        stderr_task.cancel()
         raise
-    except TimeoutError as exc:
+
+    if aborted:
         process.kill()
-        await process.wait()
-        raise TimeoutError(
-            f"yt-dlp extraction timed out after {timeout}s"
-        ) from exc
+        await wait_task
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        log.info("yt-dlp abortado para %s. Ultimas linhas:\n%s", url, _stderr_tail(10))
+        raise ResolutionAborted(url)
+
+    if timeout_reason is not None:
+        process.kill()
+        await wait_task
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        log.error(
+            "yt-dlp timed out (%s) for %s. Ultimas linhas:\n%s",
+            timeout_reason,
+            url,
+            _stderr_tail(),
+        )
+        raise TimeoutError(f"yt-dlp extraction timed out ({timeout_reason})")
+
+    await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+    stdout = b"".join(stdout_chunks)
 
     if process.returncode != 0:
-        error = stderr.decode(errors="replace").strip()
+        error = _stderr_tail()
+        log.error(
+            "yt-dlp exited with %s for %s. Ultimas linhas:\n%s",
+            process.returncode,
+            url,
+            error,
+        )
         raise RuntimeError(error or f"yt-dlp exited with {process.returncode}")
 
     try:
         return json.loads(stdout.decode(errors="replace"))
     except json.JSONDecodeError as exc:
+        raw = stdout.decode(errors="replace")
+        log.error(
+            "yt-dlp returned invalid JSON for %s (%d bytes de stdout):\n%s",
+            url,
+            len(raw),
+            raw[:2000],
+        )
         raise RuntimeError("yt-dlp returned invalid JSON") from exc
 
 
@@ -331,14 +486,24 @@ class Music(commands.Cog):
         if state.voice is not None and state.voice.source is not None:
             state.voice.source.volume = state.volume
 
-    async def _resolve_track(self, track: Track, timeout: float = YTDLP_EXTRACT_TIMEOUT_SECONDS) -> Track | None:
+    async def _resolve_track(
+        self,
+        track: Track,
+        idle_timeout: float = YTDLP_IDLE_TIMEOUT_SECONDS,
+        max_timeout: float | None = YTDLP_MAX_TIMEOUT_SECONDS,
+        abort_event: asyncio.Event | None = None,
+    ) -> Track | None:
         """Resolve uma Track via yt-dlp. Retorna None em caso de falha."""
         if track.stream_url:
             return track
 
         started_at = time.monotonic()
         try:
-            data = await _extract_info_isolated(track.query, timeout)
+            data = await _extract_info_isolated(
+                track.query, idle_timeout, max_timeout, abort_event
+            )
+        except ResolutionAborted:
+            raise
         except Exception as e:  # pylint: disable=broad-exception-caught
             log.error("Erro ao adquirir video da URL '%s': %s", track.query, e)
             return None
@@ -426,12 +591,110 @@ class Music(commands.Cog):
             except Exception as e:  # pylint: disable=broad-exception-caught
                 log.warning("Erro ao desconectar (%s): %s", guild_id, e)
 
+    def _sync_voice(self, state: GuildPlayer, guild: discord.Guild) -> bool:
+        """Sincroniza state.voice com a conexao real, descartando fantasmas.
+
+        O discord.py pode remover o voice client da guild sem que o nosso
+        estado saiba (instancia "fantasma"): state.voice continua preenchido
+        mas nao ha conexao. Aqui detectamos isso e adotamos o cliente real.
+        Retorna True se ha uma conexao valida.
+        """
+        voice = state.voice
+        if voice is not None and not voice.is_connected():
+            log.warning("Voice client fantasma descartado (guild=%s)", guild.id)
+            state.voice = None
+
+        guild_voice = guild.voice_client
+        if guild_voice is not None and guild_voice.is_connected():
+            state.voice = guild_voice
+            state.voice_channel = guild_voice.channel or state.voice_channel
+            return True
+
+        return state.voice is not None and state.voice.is_connected()
+
+    async def _connect_channel(
+        self, state: GuildPlayer, channel: discord.VoiceChannel
+    ) -> bool:
+        """Conecta o bot ao canal, com algumas tentativas. True em sucesso."""
+        for attempt in range(1, VOICE_CONNECT_ATTEMPTS + 1):
+            try:
+                state.voice = await channel.connect()
+                state.voice_channel = channel
+                log.info("Conectado ao canal '%s' (tentativa %d)", channel, attempt)
+                return True
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                log.error(
+                    "Falha ao conectar em '%s' (tentativa %d): %s",
+                    channel,
+                    attempt,
+                    e,
+                    exc_info=True,
+                )
+                if attempt < VOICE_CONNECT_ATTEMPTS:
+                    await asyncio.sleep(VOICE_RECONNECT_DELAY_SECONDS)
+        return False
+
+    async def _reconnect_voice(self, guild_id: int, channel: discord.VoiceChannel | None):
+        """Tenta voltar ao canal apos uma queda e retomar a fila."""
+        state = self._state(guild_id)
+        try:
+            if channel is None:
+                return
+            for attempt in range(1, VOICE_CONNECT_ATTEMPTS + 1):
+                # Alguem ja reconectou ou um stop limpou tudo nesse meio tempo.
+                if state.voice is not None and state.voice.is_connected():
+                    return
+                if state.current is None and not state.queue:
+                    return
+
+                await asyncio.sleep(VOICE_RECONNECT_DELAY_SECONDS)
+                if not await self._connect_channel(state, channel):
+                    continue
+
+                log.info("Reconectado ao canal '%s' (guild=%s)", channel, guild_id)
+                async with state.lock:
+                    if state.current is not None and not (
+                        state.voice.is_playing() or state.voice.is_paused()
+                    ):
+                        # A faixa que estava no ar se perdeu: recoloca na frente.
+                        state.queue.insert(0, state.current)
+                        state.current = None
+                    await self._advance_locked(guild_id, state)
+                return
+            log.error("Nao consegui reconectar ao canal (guild=%s)", guild_id)
+        finally:
+            state.reconnecting = False
+
+    def _schedule_reconnect(self, guild_id: int, channel: discord.VoiceChannel | None):
+        """Agenda uma reconexao, evitando tarefas duplicadas."""
+        state = self._state(guild_id)
+        if channel is None:
+            return
+        task = state.reconnect_task
+        if task is not None and not task.done():
+            return
+        state.reconnecting = True
+        state.reconnect_task = asyncio.create_task(
+            self._reconnect_voice(guild_id, channel)
+        )
+
     def _cancel_prefetch(self, state: GuildPlayer):
         """Cancela a resolucao antecipada em andamento, se houver."""
         task = state.prefetch_task
         state.prefetch_task = None
         if task is not None and not task.done():
             task.cancel()
+
+    def _abort_resolution(self, state: GuildPlayer) -> bool:
+        """Pede para a resolucao yt-dlp em andamento parar, sem esperar o lock.
+
+        Retorna True se havia uma resolucao em andamento (para o chamador
+        decidir o que fazer com a faixa que foi descartada).
+        """
+        was_resolving = state.resolving
+        state.abort_event.set()
+        self._cancel_prefetch(state)
+        return was_resolving
 
     def _schedule_prefetch(self, guild_id: int, state: GuildPlayer):
         """Resolve a proxima faixa em segundo plano para esconder a latencia."""
@@ -448,7 +711,7 @@ class Music(commands.Cog):
         if track.stream_url:
             return
         try:
-            resolved = await self._resolve_track(track, YTDLP_PREFETCH_TIMEOUT_SECONDS)
+            resolved = await self._resolve_track(track)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # pylint: disable=broad-exception-caught
@@ -460,6 +723,7 @@ class Music(commands.Cog):
     async def _advance_locked(self, guild_id: int, state: GuildPlayer):
         """Toca a proxima faixa valida. Deve ser chamado com o lock adquirido."""
         self._cancel_prefetch(state)
+        state.abort_event.clear()
         if state.current is not None or state.voice is None:
             return
 
@@ -467,7 +731,16 @@ class Music(commands.Cog):
         while state.queue and attempts < MAX_RESOLVE_ATTEMPTS:
             attempts += 1
             track = state.queue.pop(0)
-            resolved = await self._resolve_track(track)
+            state.resolving = True
+            try:
+                resolved = await self._resolve_track(
+                    track, abort_event=state.abort_event
+                )
+            except ResolutionAborted:
+                log.info("Resolucao de '%s' abortada (skip/stop)", track.query)
+                return
+            finally:
+                state.resolving = False
             if resolved is None:
                 continue
 
@@ -480,8 +753,10 @@ class Music(commands.Cog):
 
             state.current = resolved
             state.started_at = time.monotonic()
+            state.play_generation += 1
+            generation = state.play_generation
             try:
-                state.voice.play(source, after=self._make_after(guild_id))
+                state.voice.play(source, after=self._make_after(guild_id, generation))
             except Exception as e:
                 log.error("Erro ao tocar %s: %s", track.query, e)
                 state.current = None
@@ -506,20 +781,33 @@ class Music(commands.Cog):
         await self._disconnect_nolock(guild_id, state)
 
 
-    def _make_after(self, guild_id: int):
+    def _make_after(self, guild_id: int, generation: int):
         def after(error):
             if error:
                 log.error("Player da guild %s terminou com erro: %s", guild_id, error)
             asyncio.run_coroutine_threadsafe(
-                self._on_track_end(guild_id), self.bot.loop
+                self._on_track_end(guild_id, generation), self.bot.loop
             )
 
         return after
 
-    async def _on_track_end(self, guild_id: int):
-        """Avanca a fila quando uma musica termina (unico cleanup automatico)."""
+    async def _on_track_end(self, guild_id: int, generation: int | None = None):
+        """Avanca a fila quando uma musica termina (unico cleanup automatico).
+
+        ``generation`` identifica o player que disparou o callback. Callbacks
+        obsoletos (de uma conexao que caiu, por exemplo) sao ignorados para nao
+        interromper a faixa que acabou de comecar apos uma reconexao.
+        """
         state = self._state(guild_id)
         async with state.lock:
+            if generation is not None and generation != state.play_generation:
+                log.debug(
+                    "Ignorando after obsoleto da guild %s (gen %s != %s)",
+                    guild_id,
+                    generation,
+                    state.play_generation,
+                )
+                return
             state.current = None
             await self._advance_locked(guild_id, state)
 
@@ -660,7 +948,18 @@ class Music(commands.Cog):
         for guild_id in list(self.players):
             state = self.players[guild_id]
             voice = state.voice
-            if voice is None or voice.channel is None:
+            if voice is None:
+                continue
+            if not voice.is_connected():
+                log.warning(
+                    "Voice client fantasma detectado (guild=%s); tentando recuperar",
+                    guild_id,
+                )
+                state.voice = None
+                if state.current is not None or state.queue:
+                    self._schedule_reconnect(guild_id, state.voice_channel)
+                continue
+            if voice.channel is None:
                 continue
 
             humans = [m for m in voice.channel.members if not m.bot]
@@ -672,7 +971,9 @@ class Music(commands.Cog):
             async with state.lock:
                 await self._disconnect_nolock(guild_id, state)
 
-        if not any(state.voice for state in self.players.values()):
+        if not any(
+            state.voice or state.reconnecting for state in self.players.values()
+        ):
             log.info("Tarefa encerrada")
             self.verifyalone.cancel()  # pylint: disable=no-member
 
@@ -722,9 +1023,13 @@ class Music(commands.Cog):
     @commands.command(hidden=True)
     async def join(self, ctx: commands.Context, *, channel: discord.VoiceChannel):
         """Joins a voice channel"""
+        state = self._state(ctx.guild.id)
         if ctx.voice_client is not None:
-            return await ctx.voice_client.move_to(channel)
-        await channel.connect()
+            await ctx.voice_client.move_to(channel)
+            state.voice = ctx.voice_client
+        else:
+            state.voice = await channel.connect()
+        state.voice_channel = channel
 
     async def randomizequeue(self, ctx: commands.Context):
         """Aleatoriza a ordem das proximas musicas (mantem a atual)."""
@@ -850,6 +1155,10 @@ class Music(commands.Cog):
                 return await ctx.send("Lmao")
             state.voice.pause()
             await ctx.send(f"Pausado: `{state.current.title if state.current else ''}`")
+        elif state.voice and state.voice.is_paused():
+            await ctx.send("`Já está pausado.`")
+        else:
+            await ctx.send("`Nada tocando para pausar.`")
 
     @commands.command(aliases=["res"])
     async def resume(self, ctx: commands.Context):
@@ -880,6 +1189,10 @@ class Music(commands.Cog):
             self._apply_volume(state)
             return await ctx.send("Lmao")
 
+        # Aborta sem esperar o lock: se o yt-dlp estiver resolvendo uma faixa,
+        # ele para na hora em vez de travar o comando por ate 60s.
+        aborting = self._abort_resolution(state)
+
         async with state.lock:
             if quantidade > 1 and state.queue:
                 del state.queue[: quantidade - 1]
@@ -892,6 +1205,9 @@ class Music(commands.Cog):
                 state.voice.stop()  # dispara _on_track_end
             elif state.queue:
                 await self._advance_locked(ctx.guild.id, state)
+            elif aborting:
+                # A unica faixa em andamento era a que foi abortada.
+                await self._disconnect_nolock(ctx.guild.id, state)
             else:
                 await ctx.send("`Não tem outras músicas na lista.`")
 
@@ -903,6 +1219,9 @@ class Music(commands.Cog):
             state.volume = sys.float_info.max
             self._apply_volume(state)
             return await ctx.send("Lmao")
+
+        # Aborta uma resolucao yt-dlp em andamento antes de pegar o lock.
+        self._abort_resolution(state)
 
         async with state.lock:
             await self._disconnect_nolock(ctx.guild.id, state)
@@ -1141,6 +1460,46 @@ class Music(commands.Cog):
             for embed in embeds:
                 await ctx.send(embed=embed)
 
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ):
+        """Detecta quedas/mudancas de canal do bot e reage.
+
+        O discord.py pode perder a conexao de voz sem que o nosso estado saiba
+        (instancia "fantasma"). Se o bot saiu do canal com fila/musica em
+        andamento, tentamos voltar automaticamente; caso contrario apenas
+        limpamos o estado para o proximo comando reconectar.
+        """
+        if self.bot.user is None or member.id != self.bot.user.id:
+            return
+        state = self.players.get(member.guild.id)
+        if state is None:
+            return
+
+        if after.channel is not None:
+            # (Re)conectou ou foi movido: mantem o estado alinhado.
+            state.voice_channel = after.channel
+            current = member.guild.voice_client
+            if current is not None and current.is_connected():
+                state.voice = current
+            return
+
+        # after.channel is None -> o bot saiu / foi desconectado.
+        log.warning(
+            "Bot saiu do canal de voz (guild=%s, canal=%s)",
+            member.guild.id,
+            before.channel,
+        )
+        state.voice = None
+        left_channel = state.voice_channel or before.channel
+        if (state.current is None and not state.queue) or left_channel is None:
+            return
+        self._schedule_reconnect(member.guild.id, left_channel)
+
     @play.before_invoke
     @mashups.before_invoke
     @sdk.before_invoke
@@ -1151,38 +1510,33 @@ class Music(commands.Cog):
         state.channel = ctx.channel
         state.now_playing = None
 
-        if state.voice is None:
-            if ctx.author.voice:
-                channel = ctx.author.voice.channel
-                log.info(
-                    "ensure_voice: conectando em '%s' (guild=%s, dpy_voice_client=%s)",
-                    channel,
-                    ctx.guild.id,
-                    ctx.voice_client,
-                )
-                started = time.monotonic()
-                try:
-                    state.voice = await channel.connect()
-                except Exception as e:  # pylint: disable=broad-exception-caught
-                    log.error(
-                        "ensure_voice: falha ao conectar apos %.1fs: %s",
-                        time.monotonic() - started,
-                        e,
-                        exc_info=True,
-                    )
-                    raise
-                log.info(
-                    "ensure_voice: conectado em %.1fs", time.monotonic() - started
-                )
-                try:
-                    if not self.verifyalone.is_running():  # pylint: disable=no-member
-                        self.verifyalone.start()  # pylint: disable=no-member
-                except Exception as e:  # pylint: disable=broad-exception-caught
-                    log.error("Erro ao iniciar tarefa em background: %s", e)
-            else:
-                log.warning("Autor nao conectado no canal de voz")
-                await ctx.send("Você não está conectado em um canal de voz")
-                raise commands.CommandError("Author not connected to a voice channel.")
+        # Conexao ja valida (inclusive movida por fora): nada a fazer.
+        if self._sync_voice(state, ctx.guild):
+            return
+
+        if not ctx.author.voice:
+            log.warning("Autor nao conectado no canal de voz")
+            await ctx.send("Você não está conectado em um canal de voz")
+            raise commands.CommandError("Author not connected to a voice channel.")
+
+        channel = ctx.author.voice.channel
+        log.info(
+            "ensure_voice: conectando em '%s' (guild=%s, dpy_voice_client=%s)",
+            channel,
+            ctx.guild.id,
+            ctx.voice_client,
+        )
+        started = time.monotonic()
+        if not await self._connect_channel(state, channel):
+            await ctx.send("Não consegui conectar ao canal de voz. Tente novamente.")
+            raise commands.CommandError("Failed to connect to voice channel.")
+        log.info("ensure_voice: conectado em %.1fs", time.monotonic() - started)
+
+        try:
+            if not self.verifyalone.is_running():  # pylint: disable=no-member
+                self.verifyalone.start()  # pylint: disable=no-member
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            log.error("Erro ao iniciar tarefa em background: %s", e)
 
 
 async def setup(bot: commands.Bot):

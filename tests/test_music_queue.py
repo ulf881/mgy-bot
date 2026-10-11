@@ -41,12 +41,16 @@ class FakeVoice:
         self._paused = False
         self.disconnected = False
         self.stopped = False
+        self.channel = None
 
     def play(self, source, after=None):
         self.source = source
         self.played = source
         self.after = after
         self._playing = True
+
+    def is_connected(self):
+        return not self.disconnected
 
     def is_playing(self):
         return self._playing
@@ -118,7 +122,7 @@ def test_advance_plays_next_and_keeps_queue(monkeypatch):
     state.voice = FakeVoice()
     state.queue = [music.Track("first"), music.Track("second")]
 
-    async def fake_resolve(track):
+    async def fake_resolve(track, **kwargs):
         track.stream_url = "stream"
         track.title = track.query
         return track
@@ -140,7 +144,7 @@ def test_resolve_failure_skips_to_next(monkeypatch):
     state.voice = FakeVoice()
     state.queue = [music.Track("bad"), music.Track("good")]
 
-    async def fake_resolve(track):
+    async def fake_resolve(track, **kwargs):
         if track.query == "bad":
             return None
         track.stream_url = "stream"
@@ -163,7 +167,7 @@ def test_on_track_end_advances_queue(monkeypatch):
     state.current = music.Track("current")
     state.queue = [music.Track("next")]
 
-    async def fake_resolve(track):
+    async def fake_resolve(track, **kwargs):
         track.stream_url = "stream"
         track.title = track.query
         return track
@@ -203,3 +207,82 @@ def test_stop_clears_state(monkeypatch):
     assert state.queue == []
     assert state.voice is None
     assert fake_voice.disconnected
+
+
+def test_abort_resolution_sets_event_and_reports(monkeypatch):
+    cog = make_cog(monkeypatch)
+    state = cog._state(1)
+
+    state.resolving = True
+    assert cog._abort_resolution(state) is True
+    assert state.abort_event.is_set()
+
+    state.resolving = False
+    assert cog._abort_resolution(state) is False
+    assert state.abort_event.is_set()
+
+
+def test_advance_locked_stops_on_resolution_aborted(monkeypatch):
+    cog = make_cog(monkeypatch)
+    state = cog._state(1)
+    state.voice = FakeVoice()
+    state.queue = [music.Track("loading"), music.Track("next")]
+
+    async def fake_resolve(track, **kwargs):
+        event = kwargs.get("abort_event")
+        if event is not None:
+            event.set()
+        raise music.ResolutionAborted(track.query)
+
+    cog._resolve_track = fake_resolve
+
+    asyncio.run(cog._advance_locked(1, state))
+
+    assert state.voice.played is None
+    assert state.current is None
+    assert [t.query for t in state.queue] == ["next"]
+    assert state.resolving is False
+
+
+def test_on_track_end_ignores_stale_generation(monkeypatch):
+    cog = make_cog(monkeypatch)
+    state = cog._state(1)
+    state.voice = FakeVoice()
+    state.current = music.Track("current")
+    state.queue = [music.Track("next")]
+    state.play_generation = 5
+
+    asyncio.run(cog._on_track_end(1, generation=4))
+
+    assert state.current.query == "current"
+    assert [t.query for t in state.queue] == ["next"]
+
+
+def test_sync_voice_discards_ghost(monkeypatch):
+    cog = make_cog(monkeypatch)
+    state = cog._state(1)
+    ghost = FakeVoice()
+    ghost.disconnected = True
+    state.voice = ghost
+
+    class FakeGuild:
+        id = 1
+        voice_client = None
+
+    assert cog._sync_voice(state, FakeGuild()) is False
+    assert state.voice is None
+
+
+def test_sync_voice_adopts_real_client(monkeypatch):
+    cog = make_cog(monkeypatch)
+    state = cog._state(1)
+    real = FakeVoice()
+    real.channel = "canal"
+
+    class FakeGuild:
+        id = 1
+        voice_client = real
+
+    assert cog._sync_voice(state, FakeGuild()) is True
+    assert state.voice is real
+    assert state.voice_channel == "canal"
