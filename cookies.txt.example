@@ -1,0 +1,26 @@
+# cookies.txt.example
+#
+# Exemplo de arquivo de cookies no formato Netscape usado pelo yt-dlp
+# e pelo bot (cogs/music.py) para contornar restricoes de idade/regiao.
+#
+# Como usar:
+#   cp cookies.txt.example cookies.txt
+#
+# cookies.txt fica no .gitignore e NAO deve ser commitado. Guarde uma copia
+# por servidor/deploy (os cookies expiram e sao rotacionados pelo Google).
+#
+# Formato (7 campos separados por tab):
+#   dominio  include_subdominios  caminho  seguro  expiracao(epoch)  nome  valor
+#
+# O bot so considera cookies dos dominios youtube.com, google.com e
+# googlevideo.com (e subdominios). Exemplo de linha valida:
+
+# Netscape HTTP Cookie File
+# https://curl.haxx.se/rfc/cookie_spec.html
+# Esta e um exemplo gerado. Edite os valores abaixo:
+
+.youtube.com	TRUE	/	TRUE	4102444800	SID	SEU_SID_AQUI
+.youtube.com	TRUE	/	TRUE	4102444800	HSID	SEU_HSID_AQUI
+.youtube.com	TRUE	/	TRUE	4102444800	SSID	SEU_SSID_AQUI
+.google.com	TRUE	/	TRUE	4102444800	APISID	SEU_APISID_AQUI
+.google.com	TRUE	/	TRUE	4102444800	SAPISID	SEU_SAPISID_AQUI
