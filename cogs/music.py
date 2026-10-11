@@ -40,6 +40,8 @@ from utils.pgdatabase import Postgres
 YTDLP_SLOW_STARTUP_SECONDS = 10
 FFMPEG_SLOW_STARTUP_SECONDS = 5
 YTDLP_EXTRACT_TIMEOUT_SECONDS = 45
+YTDLP_PREFETCH_TIMEOUT_SECONDS = 180
+MAX_RESOLVE_ATTEMPTS = 10
 MASHUP_SCAN_LIMIT = 100
 
 COOKIES_FILE = os.path.abspath(
@@ -65,6 +67,12 @@ BROWSER_HEADERS = {
 
 YOUTUBE_PLAYER_CLIENTS = ["web_embedded", "web", "tv", "mweb"]
 
+YTDLP_JS_RUNTIMES = [
+    runtime.strip()
+    for runtime in os.environ.get("YTDLP_JS_RUNTIMES", "").split(",")
+    if runtime.strip()
+]
+
 ytdl_format_options = {
     "format": "bestaudio[ext=webm]/bestaudio/best",
     "outtmpl": "%(extractor)s-%(id)s-%(title)s.%(ext)s",
@@ -87,8 +95,8 @@ ytdl_format_options = {
 }
 
 ffmpeg_options = {
-    "before_options": "-nostdin -re -probesize 32k -analyzeduration 0 -rw_timeout 15000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_max_retries 3",
-    "options": "-vn -sn -dn -threads 1 -filter_threads 1 -filter_complex_threads 1 -loglevel error -nostats",
+    "before_options": "-nostdin -hide_banner -loglevel error -re -probesize 32k -analyzeduration 0 -rw_timeout 15000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_max_retries 3",
+    "options": "-vn -sn -dn -threads 1 -filter_threads 1 -filter_complex_threads 1 -nostats",
 }
 
 sp = spotipy.Spotify(
@@ -135,6 +143,7 @@ class GuildPlayer:
     equalizer: str | None = None
     started_at: float = 0.0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    prefetch_task: asyncio.Task | None = None
 
 
 _cookie_cache = {"mtime": None, "value": ""}
@@ -214,7 +223,7 @@ def _build_ffmpeg_headers(data: dict) -> dict:
     return headers
 
 
-async def _extract_info_isolated(url: str) -> dict:
+async def _extract_info_isolated(url: str, timeout: float = YTDLP_EXTRACT_TIMEOUT_SECONDS) -> dict:
     """Extrai metadados em um subprocesso que pode ser morto sem travar o bot."""
     command = [
         sys.executable,
@@ -239,6 +248,8 @@ async def _extract_info_isolated(url: str) -> dict:
     ]
     if os.path.exists(COOKIES_FILE):
         command.extend(["--cookies", COOKIES_FILE])
+    for runtime in YTDLP_JS_RUNTIMES:
+        command.extend(["--js-runtimes", runtime])
     command.append(url)
 
     process = await asyncio.create_subprocess_exec(
@@ -248,13 +259,16 @@ async def _extract_info_isolated(url: str) -> dict:
     )
     try:
         stdout, stderr = await asyncio.wait_for(
-            process.communicate(), timeout=YTDLP_EXTRACT_TIMEOUT_SECONDS
+            process.communicate(), timeout=timeout
         )
+    except asyncio.CancelledError:
+        process.kill()
+        raise
     except TimeoutError as exc:
         process.kill()
         await process.wait()
         raise TimeoutError(
-            f"yt-dlp extraction timed out after {YTDLP_EXTRACT_TIMEOUT_SECONDS}s"
+            f"yt-dlp extraction timed out after {timeout}s"
         ) from exc
 
     if process.returncode != 0:
@@ -315,14 +329,14 @@ class Music(commands.Cog):
         if state.voice is not None and state.voice.source is not None:
             state.voice.source.volume = state.volume
 
-    async def _resolve_track(self, track: Track) -> Track | None:
+    async def _resolve_track(self, track: Track, timeout: float = YTDLP_EXTRACT_TIMEOUT_SECONDS) -> Track | None:
         """Resolve uma Track via yt-dlp. Retorna None em caso de falha."""
         if track.stream_url:
             return track
 
         started_at = time.monotonic()
         try:
-            data = await _extract_info_isolated(track.query)
+            data = await _extract_info_isolated(track.query, timeout)
         except Exception as e:  # pylint: disable=broad-exception-caught
             log.error("Erro ao adquirir video da URL '%s': %s", track.query, e)
             return None
@@ -397,6 +411,7 @@ class Music(commands.Cog):
 
     async def _disconnect_nolock(self, guild_id: int, state: GuildPlayer):
         """Desconecta e limpa o estado. Deve ser chamado com o lock adquirido."""
+        self._cancel_prefetch(state)
         state.current = None
         state.queue.clear()
         state.now_playing = None
@@ -409,12 +424,46 @@ class Music(commands.Cog):
             except Exception as e:  # pylint: disable=broad-exception-caught
                 log.warning("Erro ao desconectar (%s): %s", guild_id, e)
 
+    def _cancel_prefetch(self, state: GuildPlayer):
+        """Cancela a resolucao antecipada em andamento, se houver."""
+        task = state.prefetch_task
+        state.prefetch_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _schedule_prefetch(self, guild_id: int, state: GuildPlayer):
+        """Resolve a proxima faixa em segundo plano para esconder a latencia."""
+        self._cancel_prefetch(state)
+        if not state.queue or state.queue[0].stream_url:
+            return
+        state.prefetch_task = asyncio.create_task(self._prefetch_next(guild_id, state))
+
+    async def _prefetch_next(self, guild_id: int, state: GuildPlayer):
+        """Resolve a proxima faixa da fila (mutando o proprio objeto da fila)."""
+        if not state.queue:
+            return
+        track = state.queue[0]
+        if track.stream_url:
+            return
+        try:
+            resolved = await self._resolve_track(track, YTDLP_PREFETCH_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            log.debug("Prefetch falhou para %s: %s", track.query, e)
+            return
+        if resolved is not None:
+            log.info("Prefetch pronto: %s", resolved.display_name())
+
     async def _advance_locked(self, guild_id: int, state: GuildPlayer):
         """Toca a proxima faixa valida. Deve ser chamado com o lock adquirido."""
+        self._cancel_prefetch(state)
         if state.current is not None or state.voice is None:
             return
 
-        while state.queue:
+        attempts = 0
+        while state.queue and attempts < MAX_RESOLVE_ATTEMPTS:
+            attempts += 1
             track = state.queue.pop(0)
             resolved = await self._resolve_track(track)
             if resolved is None:
@@ -422,7 +471,7 @@ class Music(commands.Cog):
 
             try:
                 source = self._build_source(resolved, state)
-            except Exception as e:  # pylint: disable=broad-exception-caught
+            except Exception as e:
                 log.error("Erro ao criar FFmpeg Audio para %s: %s", track.query, e)
                 await asyncio.sleep(0.5)
                 continue
@@ -431,7 +480,7 @@ class Music(commands.Cog):
             state.started_at = time.monotonic()
             try:
                 state.voice.play(source, after=self._make_after(guild_id))
-            except Exception as e:  # pylint: disable=broad-exception-caught
+            except Exception as e:
                 log.error("Erro ao tocar %s: %s", track.query, e)
                 state.current = None
                 await asyncio.sleep(1)
@@ -442,9 +491,18 @@ class Music(commands.Cog):
             if resolved.title == BONUS_ROOM_TITLE:
                 asyncio.create_task(self._enable_double_xp())
             await self._announce_locked(guild_id, state, resolved)
+            self._schedule_prefetch(guild_id, state)
             return
 
+        if state.queue:
+            log.warning(
+                "Nao consegui resolver %d faixas seguidas; pausando a fila (%d restantes).",
+                MAX_RESOLVE_ATTEMPTS,
+                len(state.queue),
+            )
+            return
         await self._disconnect_nolock(guild_id, state)
+
 
     def _make_after(self, guild_id: int):
         def after(error):
@@ -670,6 +728,7 @@ class Music(commands.Cog):
         """Aleatoriza a ordem das proximas musicas (mantem a atual)."""
         state = self._state(ctx.guild.id)
         async with state.lock:
+            self._cancel_prefetch(state)
             random.shuffle(state.queue)
         await ctx.send("```Alterado a ordem da lista de musica```")
 
@@ -932,6 +991,7 @@ class Music(commands.Cog):
         """Limpa a lista de musicas (mantém a música atual)"""
         state = self._state(ctx.guild.id)
         async with state.lock:
+            self._cancel_prefetch(state)
             state.queue.clear()
         await ctx.send("```Lista limpa```")
 
