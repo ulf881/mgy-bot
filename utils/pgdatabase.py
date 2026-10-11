@@ -78,13 +78,22 @@ class Postgres:
         self.connection = None
         self.cursor = None
 
+    def _mogrify(self, query: str, params) -> str:
+        """Interpola os parametros na query apenas para o log ficar copiavel."""
+        if not params:
+            return query
+        try:
+            return self.cursor.mogrify(query, params).decode("utf-8", "replace")
+        except Exception:  # pylint: disable=broad-exception-caught
+            return f"{query} params={params}"
+
     def query(self, query: str, params=None):
         """Executa uma query sql e retorna uma lista de dicionarios."""
         with self._db_lock:
             if not self._ensure_connection():
                 return None
             try:
-                log.info("Executando: %s params=%s", query, params)
+                log.info("Executando: %s", self._mogrify(query, params))
                 self.cursor.execute(query, params)
                 result = self.cursor.fetchall()
                 # cuidado com nomes de colunas repetidos
@@ -104,7 +113,7 @@ class Postgres:
             if not self._ensure_connection():
                 return None
             try:
-                log.info("Executando: %s params=%s", query, params)
+                log.info("Executando: %s", self._mogrify(query, params))
                 self.cursor.execute(query, params)
             except Exception as error:  # pylint: disable=broad-exception-caught
                 log.error("Erro ao executar update: %s", error)
