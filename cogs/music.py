@@ -1342,55 +1342,56 @@ class Music(commands.Cog):
         num - numero do mashup. Se usado com -r será o total de mashups à tocar
         -r - para random mashups
         """
-        state = self._state(ctx.guild.id)
-        state.channel = ctx.channel
-        log.info("Iniciando busca por mashups")
+        async with ctx.typing():
+            state = self._state(ctx.guild.id)
+            state.channel = ctx.channel
+            log.info("Iniciando busca por mashups")
 
-        try:
-            mashups = _load_mashups()
-        except OSError as e:
-            log.error("Erro ao ler Dropbox.html: %s", e)
-            return await ctx.send("```Lista de mashups indisponível```")
+            try:
+                mashups = _load_mashups()
+            except OSError as e:
+                log.error("Erro ao ler Dropbox.html: %s", e)
+                return await ctx.send("```Lista de mashups indisponível```")
 
-        num = "1"
-        if not args:
-            return await ctx.send(f"```{ctx.command.help}```")
-        if args[0].isdigit() and int(args[0]) > 0:
-            num = str(min(int(args[0]), MAX_QUEUE))
+            num = "1"
+            if not args:
+                return await ctx.send(f"```{ctx.command.help}```")
+            if args[0].isdigit() and int(args[0]) > 0:
+                num = str(min(int(args[0]), MAX_QUEUE))
 
-        if "-r" in args or "r" in args or "random" in args:
-            log.info("Tocando %s aleatorios", num)
-            count = min(int(num), len(mashups))
-            choices = random.sample(mashups, count) if count else []
-            tracks = [Track(link) for link in choices]
-            found = bool(tracks)
-        else:
-            found = False
-            tracks = []
-            for link in mashups[:MASHUP_SCAN_LIMIT]:
-                try:
-                    info = await _extract_info_isolated(link)
-                except Exception as exc:  # pylint: disable=broad-exception-caught
-                    log.warning("Erro ao buscar mashup '%s': %s", link, exc)
-                    continue
-                nome = info.get("title") if info else None
-                if nome and nome.startswith(num):
-                    log.info("Encontrou: %s", nome)
-                    tracks = [Track(link)]
-                    found = True
-                    break
+            if "-r" in args or "r" in args or "random" in args:
+                log.info("Tocando %s aleatorios", num)
+                count = min(int(num), len(mashups))
+                choices = random.sample(mashups, count) if count else []
+                tracks = [Track(link) for link in choices]
+                found = bool(tracks)
+            else:
+                found = False
+                tracks = []
+                for link in mashups[:MASHUP_SCAN_LIMIT]:
+                    try:
+                        info = await _extract_info_isolated(link)
+                    except Exception as exc:  # pylint: disable=broad-exception-caught
+                        log.warning("Erro ao buscar mashup '%s': %s", link, exc)
+                        continue
+                    nome = info.get("title") if info else None
+                    if nome and nome.startswith(num):
+                        log.info("Encontrou: %s", nome)
+                        tracks = [Track(link)]
+                        found = True
+                        break
 
-        if not found:
-            log.info("Mashup numero %s nao encontrado", num)
-            return await ctx.send("```Não encontrado```")
+            if not found:
+                log.info("Mashup numero %s nao encontrado", num)
+                return await ctx.send("```Não encontrado```")
 
-        await self._enqueue(state, tracks, front=False)
-        if state.voice and (state.voice.is_playing() or state.voice.is_paused()):
-            await ctx.send(
-                f"```Adicionado {num} à lista. Total na lista: {len(state.queue)}```"
-            )
-        else:
-            await self.tocar(ctx)
+            await self._enqueue(state, tracks, front=False)
+            if state.voice and (state.voice.is_playing() or state.voice.is_paused()):
+                await ctx.send(
+                    f"```Adicionado {num} à lista. Total na lista: {len(state.queue)}```"
+                )
+            else:
+                await self.tocar(ctx)
 
     @commands.command(aliases=["clear", "limpa", "clean"])
     async def limpar(self, ctx: commands.Context):
