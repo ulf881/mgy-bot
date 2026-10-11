@@ -190,9 +190,10 @@ def _log_ffmpeg_headers(label: str, url: str, headers: dict):
 async def _extract_info_isolated(url: str):
     """Extract metadata in a killable process so yt-dlp cannot block the bot.
 
-    O stderr do yt-dlp é lido em tempo real. Em caso de timeout ou erro as
-    últimas linhas são registradas para diagnóstico. Defina YTDLP_DEBUG=1 no
-    ambiente para rodar com --verbose e ver todo o log no console.
+    O stderr do yt-dlp é lido em tempo real e registrado no log (busca,
+    download, avisos). Em caso de timeout ou erro as últimas linhas também
+    são registradas. Defina YTDLP_DEBUG=1 no ambiente para rodar com
+    --verbose e incluir as linhas [debug].
     """
     command = [
         sys.executable,
@@ -215,8 +216,6 @@ async def _extract_info_isolated(url: str):
     ]
     if YTDLP_DEBUG:
         command.append("--verbose")
-    else:
-        command.extend(["--quiet", "--no-warnings"])
     if IF_NOT_EXISTS:
         command.extend(["--cookies", COOKIES_FILE])
     if YTDLP_JS_RUNTIMES:
@@ -229,35 +228,38 @@ async def _extract_info_isolated(url: str):
         *command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=1024 * 1024,
     )
 
     stdout_chunks: List[bytes] = []
     stderr_lines: List[str] = []
 
-    async def _read_stream(stream, on_line):
+    async def _drain_stdout(stream):
+        # Lê em blocos: o JSON de --dump-single-json é uma única linha enorme,
+        # então readline() estouraria o limite do StreamReader.
+        if stream is None:
+            return
+        while True:
+            chunk = await stream.read(65536)
+            if not chunk:
+                break
+            stdout_chunks.append(chunk)
+
+    async def _drain_stderr(stream):
         if stream is None:
             return
         while True:
             raw = await stream.readline()
             if not raw:
                 break
-            on_line(raw)
-
-    def _on_stdout(raw: bytes):
-        stdout_chunks.append(raw)
-
-    def _on_stderr(raw: bytes):
-        line = raw.decode(errors="replace").rstrip()
-        if not line:
-            return
-        stderr_lines.append(line)
-        if YTDLP_DEBUG:
+            line = raw.decode(errors="replace").rstrip()
+            if not line:
+                continue
+            stderr_lines.append(line)
             log.info("yt-dlp [%s] %s", url, line)
-        else:
-            log.debug("yt-dlp [%s] %s", url, line)
 
-    stdout_task = asyncio.create_task(_read_stream(process.stdout, _on_stdout))
-    stderr_task = asyncio.create_task(_read_stream(process.stderr, _on_stderr))
+    stdout_task = asyncio.create_task(_drain_stdout(process.stdout))
+    stderr_task = asyncio.create_task(_drain_stderr(process.stderr))
 
     def _stderr_tail(limit: int = 50) -> str:
         return "\n".join(stderr_lines[-limit:]) or "(sem saída do yt-dlp)"
