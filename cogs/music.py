@@ -57,7 +57,7 @@ BROWSER_HEADERS = {
     "Origin": "https://www.youtube.com",
 }
 
-YOUTUBE_PLAYER_CLIENTS = ["web_embedded", "web", "tv", "mweb"]
+YOUTUBE_PLAYER_CLIENTS = ["web_embedded", "web"]
 
 YTDLP_JS_RUNTIMES = [
     runtime.strip()
