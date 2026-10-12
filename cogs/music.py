@@ -122,10 +122,8 @@ YOUTUBE_PLAYER_CLIENTS = ["visionos", "web_embedded", "tv_downgraded", "web"]
 # cookies ausentes/expirados e o "Sign in to confirm you're not a bot".
 COOKIE_STALE_DAYS = 30
 _YOUTUBE_LOGIN_COOKIES = ("SID=", "SAPISID=", "__Secure-1PSID=", "__Secure-3PSID=")
-# Limite do arquivo aceito pelo comando "mgy cookies" (o cookies.txt do
-# YouTube costuma ter poucas centenas de KB).
-MAX_COOKIES_BYTES = 512 * 1024
 # Aviso anexado ao embed de "tocando agora" quando os cookies foram recusados.
+# O comando Staff "mgy cookies" (cogs/mod.py) ja existe para atualizar o arquivo.
 _COOKIE_STALE_WARNING = (
     "\n⚠️ Cookies do YouTube vencidos. Staff: atualize com "
     "`mgy cookies` (anexe um cookies.txt novo)."
@@ -270,48 +268,6 @@ _cookie_cache = {"mtime": None, "value": ""}
 _mashups_cache: list[str] = []
 
 
-def _parse_cookie_header(text: str) -> str:
-    """Monta o header Cookie (YouTube/Google) a partir de um cookies.txt Netscape."""
-    cookie_pairs = []
-    for line in (text or "").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-
-        fields = re.split(r"\s+", line)
-        if len(fields) < 7:
-            continue
-
-        domain, _, _, _, _, name, *rest = fields
-        value = " ".join(rest) if rest else ""
-        if not name or not value:
-            continue
-
-        domain = domain.removeprefix(".")
-
-        if domain in {
-            "youtube.com",
-            "google.com",
-            "googlevideo.com",
-        } or domain.endswith(
-            (
-                ".youtube.com",
-                ".google.com",
-                ".googlevideo.com",
-                ".youtube-nocookie.com",
-            )
-        ):
-            cookie_pairs.append(f"{name}={value}")
-
-    seen = set()
-    ordered = []
-    for cookie in cookie_pairs:
-        if cookie not in seen:
-            seen.add(cookie)
-            ordered.append(cookie)
-    return "; ".join(ordered)
-
-
 def _extract_cookie_header(path: str) -> str:
     """Le o arquivo Netscape cookies e retorna o header Cookie (cacheado)."""
     try:
@@ -322,13 +278,49 @@ def _extract_cookie_header(path: str) -> str:
     if _cookie_cache["mtime"] == mtime:
         return _cookie_cache["value"]
 
+    cookie_pairs = []
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as handle:
-            text = handle.read()
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+
+                fields = re.split(r"\s+", line)
+                if len(fields) < 7:
+                    continue
+
+                domain, _, _, _, _, name, *rest = fields
+                value = " ".join(rest) if rest else ""
+                if not name or not value:
+                    continue
+
+                domain = domain.removeprefix(".")
+
+                if domain in {
+                    "youtube.com",
+                    "google.com",
+                    "googlevideo.com",
+                } or domain.endswith(
+                    (
+                        ".youtube.com",
+                        ".google.com",
+                        ".googlevideo.com",
+                        ".youtube-nocookie.com",
+                    )
+                ):
+                    cookie_pairs.append(f"{name}={value}")
     except OSError:
         return ""
 
-    value = _parse_cookie_header(text)
+    seen = set()
+    ordered = []
+    for cookie in cookie_pairs:
+        if cookie not in seen:
+            seen.add(cookie)
+            ordered.append(cookie)
+
+    value = "; ".join(ordered)
     _cookie_cache["mtime"] = mtime
     _cookie_cache["value"] = value
     return value
@@ -419,28 +411,6 @@ def _mark_cookies_rejected() -> bool:
     changed = _cookies_rejected["mtime"] != mtime
     _cookies_rejected["mtime"] = mtime
     return changed
-
-
-def _looks_like_cookies(text: str) -> bool:
-    """Heuristica: o arquivo parece um cookies.txt do YouTube (Netscape)?"""
-    if not text or ("youtube.com" not in text and "google.com" not in text):
-        return False
-    header = _parse_cookie_header(text)
-    return any(name in header for name in _YOUTUBE_LOGIN_COOKIES)
-
-
-def _write_cookies_file(text: str) -> None:
-    """Grava o cookies.txt de forma atomica e invalida os caches."""
-    tmp = f"{COOKIES_FILE}.tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        handle.write(text)
-    os.replace(tmp, COOKIES_FILE)
-
-    global _cookie_status_key
-    _cookie_cache["mtime"] = None
-    _cookie_cache["value"] = ""
-    _cookie_status_key = object()
-    _cookies_rejected["mtime"] = None
 
 
 def _build_ffmpeg_headers(data: dict) -> dict:
@@ -1788,52 +1758,6 @@ class Music(commands.Cog):
                 (name, url, str(usuarios[0]["id_usuarios"]), titulo),
             )
             await ctx.send(f"Adicionado {name}. Para tocar use: mgy t {name}")
-
-    @commands.command()
-    @commands.has_role("Staff")
-    async def cookies(self, ctx: commands.Context):
-        """Atualiza o cookies.txt do YouTube a partir de um anexo.
-
-        Anexe um arquivo cookies.txt (exportado de uma sessão logada do
-        YouTube) junto do comando. Usado quando o YouTube passa a exigir login.
-        """
-        anexos = ctx.message.attachments
-        if not anexos:
-            return await ctx.send(
-                "Anexe um `cookies.txt` junto do comando "
-                "(exportado de uma sessão logada do YouTube)."
-            )
-
-        anexo = anexos[0]
-        if anexo.size > MAX_COOKIES_BYTES:
-            return await ctx.send(
-                f"Arquivo grande demais ({anexo.size} bytes). "
-                f"Máximo: {MAX_COOKIES_BYTES} bytes."
-            )
-
-        try:
-            raw = await anexo.read()
-        except discord.HTTPException as e:
-            log.warning("Erro ao ler anexo de cookies: %s", e)
-            return await ctx.send("Não consegui ler o arquivo anexado.")
-
-        texto = raw.decode("utf-8", errors="replace")
-        if not _looks_like_cookies(texto):
-            return await ctx.send(
-                "O arquivo não parece um `cookies.txt` do YouTube "
-                "(formato Netscape, exportado de uma sessão logada)."
-            )
-
-        try:
-            _write_cookies_file(texto)
-        except OSError as e:
-            log.error("Erro ao gravar cookies.txt: %s", e)
-            return await ctx.send("Não consegui salvar os cookies. Veja o log.")
-
-        log.info("cookies.txt atualizado por %s (%d bytes)", ctx.author, len(raw))
-        await ctx.send(
-            "Cookies do YouTube atualizados. Vou usá-los nas próximas buscas."
-        )
 
     @commands.command(aliases=["mlist", "mlinks", "links"])
     async def musiclinks(self, ctx: commands.Context):

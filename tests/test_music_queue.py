@@ -403,33 +403,6 @@ def test_is_bot_check():
     assert not music._is_bot_check("")
 
 
-def test_parse_cookie_header_filters_domains():
-    text = (
-        "# Netscape HTTP Cookie File\n"
-        ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tlogin-sid\n"
-        ".youtube.com\tTRUE\t/\tTRUE\t0\tVISITOR_INFO1_LIVE\tvisitor\n"
-        ".example.com\tTRUE\t/\tTRUE\t0\tSID\tother\n"
-    )
-    header = music._parse_cookie_header(text)
-    assert "SID=login-sid" in header
-    assert "VISITOR_INFO1_LIVE=visitor" in header
-    assert "other" not in header
-
-
-def test_looks_like_cookies():
-    good = (
-        "# Netscape HTTP Cookie File\n"
-        ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tlogin-sid\n"
-    )
-    assert music._looks_like_cookies(good)
-    assert not music._looks_like_cookies("")
-    assert not music._looks_like_cookies("some random text")
-    # youtube.com mas sem cookie de login do YouTube
-    assert not music._looks_like_cookies(
-        "youtube.com\n.youtube.com\tTRUE\t/\tTRUE\t0\tVISITOR_INFO1_LIVE\tx\n"
-    )
-
-
 def _fake_extract_data():
     return {
         "url": "https://c.example.com/v?expire=%d" % (int(time.time()) + 3600),
@@ -514,22 +487,6 @@ def test_resolve_track_reraises_bot_check_without_cookies(monkeypatch):
     except music.BotCheckError:
         raised = True
     assert raised
-
-
-def test_write_cookies_file_updates_cache(monkeypatch, tmp_path):
-    path = tmp_path / "cookies.txt"
-    monkeypatch.setattr(music, "COOKIES_FILE", str(path))
-    monkeypatch.setattr(music, "_cookie_cache", {"mtime": None, "value": ""})
-    monkeypatch.setattr(music, "_cookies_rejected", {"mtime": 123})
-
-    text = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tlogin-sid\n"
-    music._write_cookies_file(text)
-
-    assert path.read_text() == text
-    assert not (tmp_path / "cookies.txt.tmp").exists()
-    assert music._cookies_rejected["mtime"] is None
-    assert "SID=login-sid" in music._extract_cookie_header(str(path))
-    assert music._has_login_cookies() is True
 
 
 def test_has_login_cookies_false_without_file(monkeypatch, tmp_path):
