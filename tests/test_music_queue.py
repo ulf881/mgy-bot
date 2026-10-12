@@ -11,6 +11,8 @@ os.environ.setdefault("SPOTIPY_CLIENT_ID", "test-id")
 os.environ.setdefault("SPOTIPY_CLIENT_SECRET", "test-secret")
 os.environ.setdefault("YOUTUBE_API_KEY", "test-key")
 
+import discord
+
 from cogs import music
 
 
@@ -129,6 +131,34 @@ def test_is_url():
     assert music._is_url("https://www.youtube.com/watch?v=abc")
     assert not music._is_url("just a search term")
     assert not music._is_url("")
+
+
+def test_build_source_wraps_in_volume_transformer(monkeypatch):
+    """source precisa ser um PCMVolumeTransformer, senao _apply_volume nao faz nada."""
+    cog = make_cog(monkeypatch)
+    state = cog._state(1)
+    state.volume = 0.25
+    track = music.Track("x")
+    track.stream_url = "https://cdn.example.com/x"
+
+    class FakeFFmpeg(discord.AudioSource):
+        def read(self):
+            return b""
+
+    created = {}
+
+    def fake_ffmpeg(url, **options):
+        created["url"] = url
+        return FakeFFmpeg()
+
+    monkeypatch.setattr(music.discord, "FFmpegPCMAudio", fake_ffmpeg)
+
+    source = cog._build_source(track, state)
+
+    assert isinstance(source, discord.PCMVolumeTransformer)
+    assert isinstance(source.original, FakeFFmpeg)
+    assert source.volume == 0.25
+    assert created["url"] == "https://cdn.example.com/x"
 
 
 def test_advance_plays_next_and_keeps_queue(monkeypatch):

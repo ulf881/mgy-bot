@@ -787,7 +787,10 @@ class Music(commands.Cog):
         if state.equalizer:
             options["options"] = f"{options.get('options', '')} {state.equalizer}"
 
-        return discord.FFmpegPCMAudio(track.stream_url, **options)
+        source = discord.FFmpegPCMAudio(track.stream_url, **options)
+        # Envolve em PCMVolumeTransformer para que `source.volume` funcione
+        # (sem isso `_apply_volume` nao teria efeito nenhum).
+        return discord.PCMVolumeTransformer(source, volume=state.volume)
 
     async def _announce_locked(self, guild_id: int, state: GuildPlayer, track: Track):
         """Envia/edita a mensagem de 'tocando agora'."""
