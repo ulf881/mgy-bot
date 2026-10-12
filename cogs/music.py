@@ -42,7 +42,9 @@ FFMPEG_SLOW_STARTUP_SECONDS = 5
 # Timeout por inatividade: se o yt-dlp ficar sem emitir nenhuma linha por esse
 # tempo, consideramos que travou e o processo e morto. Enquanto ele continua
 # progredindo (imprimindo linhas de log), o contador reinicia.
-YTDLP_IDLE_TIMEOUT_SECONDS = 60
+# 90s: resolve lentas mas vivas (ex.: JS challenge ocasional) terminam em vez
+# de serem mortas no prefetch; skip/stop continuam abortando na hora.
+YTDLP_IDLE_TIMEOUT_SECONDS = 90
 # Teto absoluto de seguranca, mesmo que o yt-dlp continue imprimindo saida.
 YTDLP_MAX_TIMEOUT_SECONDS = 900
 # Intervalo de checagem do yt-dlp: curto para reagir rapido a skip/stop
@@ -97,7 +99,11 @@ BROWSER_HEADERS = {
     "Origin": "https://www.youtube.com",
 }
 
-YOUTUBE_PLAYER_CLIENTS = ["web_embedded", "web"]
+# Ordem importa: o yt-dlp tenta os clientes na ordem e usa o primeiro que
+# retorna formatos. web_embedded/web estao passando por PO token + JS
+# challenges (demorados e as vezes travados via deno); android/ios/tv/mweb
+# na maioria das vezes extraem direto, sem desafio.
+YOUTUBE_PLAYER_CLIENTS = ["android", "ios", "tv", "mweb", "web_embedded", "web"]
 
 YTDLP_JS_RUNTIMES = [
     runtime.strip()
@@ -127,7 +133,7 @@ ytdl_format_options = {
 }
 
 ffmpeg_options = {
-    "before_options": "-nostdin -hide_banner -loglevel error -re -probesize 32k -analyzeduration 0 -rw_timeout 15000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_max_retries 3",
+    "before_options": "-nostdin -hide_banner -loglevel error -re -probesize 256k -analyzeduration 0 -rw_timeout 15000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_max_retries 3",
     "options": "-vn -sn -dn -threads 1 -filter_threads 1 -filter_complex_threads 1 -nostats",
 }
 
