@@ -51,6 +51,9 @@ YTDLP_MAX_TIMEOUT_SECONDS = 900
 # Intervalo de checagem do yt-dlp: curto para reagir rapido a skip/stop
 # (abort) e para medir a inatividade com precisao.
 YTDLP_POLL_INTERVAL_SECONDS = 1.0
+# Prioridade (nice) do yt-dlp e do deno que ele spawna: quanto maior, menor a
+# prioridade de CPU, para nao competir com o ffmpeg durante a resolucao.
+YTDLP_NICE_LEVEL = 15
 # Reconexao de voz: quantas tentativas e quanto esperar entre elas.
 VOICE_CONNECT_ATTEMPTS = 3
 VOICE_RECONNECT_DELAY_SECONDS = 2.0
@@ -89,6 +92,14 @@ class ResolutionAborted(Exception):
     """Levantada quando skip/stop cancela uma resolucao yt-dlp em andamento."""
 
 
+class BotCheckError(RuntimeError):
+    """O yt-dlp exigiu login do YouTube (bot check / LOGIN_REQUIRED).
+
+    Levantada quando nem os cookies atuais nem a tentativa sem login
+    (clientes sem cookie, como o visionos) conseguiram extrair a faixa.
+    """
+
+
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
     "Accept": "*/*",
@@ -111,6 +122,14 @@ YOUTUBE_PLAYER_CLIENTS = ["visionos", "web_embedded", "tv_downgraded", "web"]
 # cookies ausentes/expirados e o "Sign in to confirm you're not a bot".
 COOKIE_STALE_DAYS = 30
 _YOUTUBE_LOGIN_COOKIES = ("SID=", "SAPISID=", "__Secure-1PSID=", "__Secure-3PSID=")
+# Limite do arquivo aceito pelo comando "mgy cookies" (o cookies.txt do
+# YouTube costuma ter poucas centenas de KB).
+MAX_COOKIES_BYTES = 512 * 1024
+# Aviso anexado ao embed de "tocando agora" quando os cookies foram recusados.
+_COOKIE_STALE_WARNING = (
+    "\n⚠️ Cookies do YouTube vencidos. Staff: atualize com "
+    "`mgy cookies` (anexe um cookies.txt novo)."
+)
 
 YTDLP_JS_RUNTIMES = [
     runtime.strip()
@@ -251,6 +270,48 @@ _cookie_cache = {"mtime": None, "value": ""}
 _mashups_cache: list[str] = []
 
 
+def _parse_cookie_header(text: str) -> str:
+    """Monta o header Cookie (YouTube/Google) a partir de um cookies.txt Netscape."""
+    cookie_pairs = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        fields = re.split(r"\s+", line)
+        if len(fields) < 7:
+            continue
+
+        domain, _, _, _, _, name, *rest = fields
+        value = " ".join(rest) if rest else ""
+        if not name or not value:
+            continue
+
+        domain = domain.removeprefix(".")
+
+        if domain in {
+            "youtube.com",
+            "google.com",
+            "googlevideo.com",
+        } or domain.endswith(
+            (
+                ".youtube.com",
+                ".google.com",
+                ".googlevideo.com",
+                ".youtube-nocookie.com",
+            )
+        ):
+            cookie_pairs.append(f"{name}={value}")
+
+    seen = set()
+    ordered = []
+    for cookie in cookie_pairs:
+        if cookie not in seen:
+            seen.add(cookie)
+            ordered.append(cookie)
+    return "; ".join(ordered)
+
+
 def _extract_cookie_header(path: str) -> str:
     """Le o arquivo Netscape cookies e retorna o header Cookie (cacheado)."""
     try:
@@ -261,49 +322,13 @@ def _extract_cookie_header(path: str) -> str:
     if _cookie_cache["mtime"] == mtime:
         return _cookie_cache["value"]
 
-    cookie_pairs = []
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-
-                fields = re.split(r"\s+", line)
-                if len(fields) < 7:
-                    continue
-
-                domain, _, _, _, _, name, *rest = fields
-                value = " ".join(rest) if rest else ""
-                if not name or not value:
-                    continue
-
-                domain = domain.removeprefix(".")
-
-                if domain in {
-                    "youtube.com",
-                    "google.com",
-                    "googlevideo.com",
-                } or domain.endswith(
-                    (
-                        ".youtube.com",
-                        ".google.com",
-                        ".googlevideo.com",
-                        ".youtube-nocookie.com",
-                    )
-                ):
-                    cookie_pairs.append(f"{name}={value}")
+            text = handle.read()
     except OSError:
         return ""
 
-    seen = set()
-    ordered = []
-    for cookie in cookie_pairs:
-        if cookie not in seen:
-            seen.add(cookie)
-            ordered.append(cookie)
-
-    value = "; ".join(ordered)
+    value = _parse_cookie_header(text)
     _cookie_cache["mtime"] = mtime
     _cookie_cache["value"] = value
     return value
@@ -361,6 +386,63 @@ def _is_bot_check(text: str) -> bool:
     return "sign in to confirm" in lowered or "login_required" in lowered
 
 
+def _has_login_cookies() -> bool:
+    """True se o cookies.txt existe e tem cookies de login do YouTube."""
+    try:
+        os.path.getmtime(COOKIES_FILE)
+    except OSError:
+        return False
+    header = _extract_cookie_header(COOKIES_FILE)
+    return any(name in header for name in _YOUTUBE_LOGIN_COOKIES)
+
+
+# mtime do cookies.txt no momento em que ele foi rejeitado num bot check.
+# Enquanto o arquivo nao mudar, extraimos sem cookies (clientes sem cookie,
+# tipo o visionos) para nao pagar a tentativa falha em toda musica.
+_cookies_rejected = {"mtime": None}
+
+
+def _cookies_rejected_for_current_file() -> bool:
+    try:
+        mtime = os.path.getmtime(COOKIES_FILE)
+    except OSError:
+        return False
+    return _cookies_rejected["mtime"] is not None and _cookies_rejected["mtime"] == mtime
+
+
+def _mark_cookies_rejected() -> bool:
+    """Marca os cookies atuais como ruins. True se foi a primeira vez."""
+    try:
+        mtime = os.path.getmtime(COOKIES_FILE)
+    except OSError:
+        mtime = None
+    changed = _cookies_rejected["mtime"] != mtime
+    _cookies_rejected["mtime"] = mtime
+    return changed
+
+
+def _looks_like_cookies(text: str) -> bool:
+    """Heuristica: o arquivo parece um cookies.txt do YouTube (Netscape)?"""
+    if not text or ("youtube.com" not in text and "google.com" not in text):
+        return False
+    header = _parse_cookie_header(text)
+    return any(name in header for name in _YOUTUBE_LOGIN_COOKIES)
+
+
+def _write_cookies_file(text: str) -> None:
+    """Grava o cookies.txt de forma atomica e invalida os caches."""
+    tmp = f"{COOKIES_FILE}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.replace(tmp, COOKIES_FILE)
+
+    global _cookie_status_key
+    _cookie_cache["mtime"] = None
+    _cookie_cache["value"] = ""
+    _cookie_status_key = object()
+    _cookies_rejected["mtime"] = None
+
+
 def _build_ffmpeg_headers(data: dict) -> dict:
     """Constroi headers similares a um navegador para URLs do GoogleVideo."""
     headers = dict(BROWSER_HEADERS)
@@ -381,6 +463,7 @@ async def _extract_info_isolated(
     idle_timeout: float = YTDLP_IDLE_TIMEOUT_SECONDS,
     max_timeout: float | None = YTDLP_MAX_TIMEOUT_SECONDS,
     abort_event: asyncio.Event | None = None,
+    use_cookies: bool = True,
 ) -> dict:
     """Extrai metadados em um subprocesso que pode ser morto sem travar o bot.
 
@@ -391,6 +474,10 @@ async def _extract_info_isolated(
 
     Se ``abort_event`` for setado (por skip/stop), o subprocesso e morto e
     :class:`ResolutionAborted` e levantada.
+
+    ``use_cookies=False`` forca uma extracao anonima (sem ``--cookies``): sem
+    login o yt-dlp usa clientes sem cookie (ex. visionos), util como fallback
+    quando os cookies estao ausentes/expirados.
 
     --verbose e sempre usado para forcar o yt-dlp a enviar as mensagens para
     o stderr, deixando o stdout apenas com o JSON (sem --quiet o yt-dlp
@@ -417,7 +504,7 @@ async def _extract_info_isolated(
         "youtube:player_client=" + ",".join(YOUTUBE_PLAYER_CLIENTS),
         "--verbose",
     ]
-    if os.path.exists(COOKIES_FILE):
+    if use_cookies and os.path.exists(COOKIES_FILE):
         command.extend(["--cookies", COOKIES_FILE])
     _log_cookie_status_once()
     if YTDLP_JS_RUNTIMES:
@@ -430,7 +517,7 @@ async def _extract_info_isolated(
     # YouTube) roda em prioridade menor que o ffmpeg, para nao roubar CPU
     # do audio durante a resolucao do prefetch.
     if sys.platform != "win32" and shutil.which("nice"):
-        command = ["nice", "-n", "10", *command]
+        command = ["nice", "-n", str(YTDLP_NICE_LEVEL), *command]
 
     process = await asyncio.create_subprocess_exec(
         *command,
@@ -543,19 +630,15 @@ async def _extract_info_isolated(
     if process.returncode != 0:
         error = _stderr_tail()
         if _is_bot_check(error):
-            log.error(
-                "YouTube exigiu login (bot check) para %s. Renove o "
-                "cookies.txt com uma sessao logada do YouTube. Ultimas linhas:\n%s",
-                url,
-                error,
-            )
-        else:
-            log.error(
-                "yt-dlp exited with %s for %s. Ultimas linhas:\n%s",
-                process.returncode,
-                url,
-                error,
-            )
+            # O chamador decide o fallback (tentar sem cookies) e a mensagem
+            # ao usuario; aqui so sinalizamos o tipo do erro.
+            raise BotCheckError(error or "YouTube exigiu login (bot check)")
+        log.error(
+            "yt-dlp exited with %s for %s. Ultimas linhas:\n%s",
+            process.returncode,
+            url,
+            error,
+        )
         raise RuntimeError(error or f"yt-dlp exited with {process.returncode}")
 
     try:
@@ -626,19 +709,28 @@ class Music(commands.Cog):
         max_timeout: float | None = YTDLP_MAX_TIMEOUT_SECONDS,
         abort_event: asyncio.Event | None = None,
     ) -> Track | None:
-        """Resolve uma Track via yt-dlp. Retorna None em caso de falha."""
+        """Resolve uma Track via yt-dlp. Retorna None em caso de falha.
+
+        Usa cookies quando disponiveis. Se o YouTube responder com bot check,
+        tenta de novo sem login (clientes sem cookie, ex. visionos) e marca os
+        cookies como ruins. Levanta :class:`BotCheckError` quando nem o fallback
+        sem cookie consegue extrair.
+        """
         if _is_track_fresh(track):
             return track
         if track.stream_url:
             log.info("Stream URL de '%s' expirou; resolvendo novamente", track.query)
             track.stream_url = None
 
+        use_cookies = _has_login_cookies() and not _cookies_rejected_for_current_file()
         started_at = time.monotonic()
         try:
-            data = await _extract_info_isolated(
-                track.query, idle_timeout, max_timeout, abort_event
+            data = await self._extract_with_cookie_fallback(
+                track, idle_timeout, max_timeout, abort_event, use_cookies
             )
         except ResolutionAborted:
+            raise
+        except BotCheckError:
             raise
         except Exception as e:  # pylint: disable=broad-exception-caught
             log.error("Erro ao adquirir video da URL '%s': %s", track.query, e)
@@ -662,6 +754,49 @@ class Music(commands.Cog):
         if elapsed >= YTDLP_SLOW_STARTUP_SECONDS:
             log.warning("yt-dlp startup levou %.1fs para %s", elapsed, track.query)
         return track
+
+    async def _extract_with_cookie_fallback(
+        self,
+        track: Track,
+        idle_timeout: float,
+        max_timeout: float | None,
+        abort_event: asyncio.Event | None,
+        use_cookies: bool,
+    ) -> dict:
+        """Extrai a faixa; se o login for recusado, tenta anonimo (sem cookies).
+
+        Sem login o yt-dlp passa a usar clientes sem cookie (ex. visionos), o
+        que costuma escapar do bot check. Marcamos os cookies atuais como ruins
+        assim que o login e recusado, para as proximas resolucoes irem direto no
+        modo anonimo (mais rapido) e para o embed avisar a Staff, ate o arquivo
+        ser trocado (comando ``mgy cookies``).
+        """
+        try:
+            return await _extract_info_isolated(
+                track.query,
+                idle_timeout,
+                max_timeout,
+                abort_event,
+                use_cookies=use_cookies,
+            )
+        except BotCheckError:
+            if not use_cookies:
+                raise
+            log.warning(
+                "Cookies do YouTube recusados (bot check) para '%s'; tentando sem login",
+                track.query,
+            )
+            if _mark_cookies_rejected():
+                log.warning(
+                    "Extraindo sem cookies ate o cookies.txt ser atualizado (mgy cookies)"
+                )
+            return await _extract_info_isolated(
+                track.query,
+                idle_timeout,
+                max_timeout,
+                abort_event,
+                use_cookies=False,
+            )
 
     def _build_source(self, track: Track, state: GuildPlayer, extra_before: str = ""):
         """Cria o FFmpegPCMAudio para uma Track ja resolvida."""
@@ -697,6 +832,8 @@ class Music(commands.Cog):
         description += f"\n Duração: {minutes:02d}:{seconds:02d}"
         if state.queue:
             description += f"\nAinda na lista: {len(state.queue)}"
+        if _cookies_rejected_for_current_file():
+            description += _COOKIE_STALE_WARNING
 
         embed = discord.Embed(description=description, colour=0xFA00D4)
         embed.set_footer(text=guild_macro(guild_id), icon_url=AVATAR_URL)
@@ -712,6 +849,26 @@ class Music(commands.Cog):
             state.now_playing = await state.channel.send(embed=embed)
         except Exception as e:  # pylint: disable=broad-exception-caught
             log.warning("Erro ao enviar mensagem de reproducao: %s", e)
+
+    async def _edit_now_playing_cookies_warning(self, state: GuildPlayer):
+        """Acrescenta o aviso de cookies a mensagem 'tocando agora', se houver.
+
+        Usado quando a extracao falha (bot check) sem uma faixa nova para
+        anunciar: edita o embed atual em vez de postar uma mensagem solta.
+        """
+        embeds = getattr(state.now_playing, "embeds", None) or []
+        if not embeds:
+            return
+        embed = embeds[0]
+        if _COOKIE_STALE_WARNING.strip() in (embed.description or ""):
+            return
+        embed.description = (embed.description or "") + _COOKIE_STALE_WARNING
+        try:
+            await state.now_playing.edit(embed=embed)
+        except discord.HTTPException:
+            state.now_playing = None
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            log.warning("Erro ao editar aviso de cookies: %s", e)
 
     async def _disconnect_nolock(self, guild_id: int, state: GuildPlayer):
         """Desconecta e limpa o estado. Deve ser chamado com o lock adquirido."""
@@ -857,6 +1014,35 @@ class Music(commands.Cog):
         if resolved is not None:
             log.info("Prefetch pronto: %s", resolved.display_name())
 
+    async def _resolve_for_playback(
+        self, state: GuildPlayer, track: Track
+    ) -> Track | None:
+        """Resolve a faixa mantendo 'digitando...' enquanto o yt-dlp roda.
+
+        Cobre o skip e a troca automatica de faixa: sem isso, pular musicas em
+        sequencia nao dava nenhum sinal de que o bot estava resolvendo a
+        proxima.
+        """
+        channel = state.channel
+        if channel is None or not hasattr(channel, "typing"):
+            return await self._resolve_track(track, abort_event=state.abort_event)
+
+        try:
+            typing_cm = channel.typing()
+            await typing_cm.__aenter__()
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            # Sem permissao de enviar mensagens, por exemplo: resolve mesmo assim.
+            log.debug("Sem indicador de digitando: %s", e)
+            return await self._resolve_track(track, abort_event=state.abort_event)
+
+        try:
+            return await self._resolve_track(track, abort_event=state.abort_event)
+        finally:
+            try:
+                await typing_cm.__aexit__(None, None, None)
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                log.debug("Erro ao encerrar digitando: %s", e)
+
     async def _advance_locked(self, guild_id: int, state: GuildPlayer):
         """Toca a proxima faixa valida. Deve ser chamado com o lock adquirido."""
         self._cancel_prefetch(state)
@@ -870,12 +1056,18 @@ class Music(commands.Cog):
             track = state.queue.pop(0)
             state.resolving = True
             try:
-                resolved = await self._resolve_track(
-                    track, abort_event=state.abort_event
-                )
+                resolved = await self._resolve_for_playback(state, track)
             except ResolutionAborted:
                 log.info("Resolucao de '%s' abortada (skip/stop)", track.query)
                 return
+            except BotCheckError:
+                log.error(
+                    "YouTube exigiu login (bot check) para '%s'; nenhum cliente "
+                    "conseguiu extrair",
+                    track.query,
+                )
+                await self._edit_now_playing_cookies_warning(state)
+                continue
             finally:
                 state.resolving = False
             if resolved is None:
@@ -1596,6 +1788,52 @@ class Music(commands.Cog):
                 (name, url, str(usuarios[0]["id_usuarios"]), titulo),
             )
             await ctx.send(f"Adicionado {name}. Para tocar use: mgy t {name}")
+
+    @commands.command()
+    @commands.has_role("Staff")
+    async def cookies(self, ctx: commands.Context):
+        """Atualiza o cookies.txt do YouTube a partir de um anexo.
+
+        Anexe um arquivo cookies.txt (exportado de uma sessão logada do
+        YouTube) junto do comando. Usado quando o YouTube passa a exigir login.
+        """
+        anexos = ctx.message.attachments
+        if not anexos:
+            return await ctx.send(
+                "Anexe um `cookies.txt` junto do comando "
+                "(exportado de uma sessão logada do YouTube)."
+            )
+
+        anexo = anexos[0]
+        if anexo.size > MAX_COOKIES_BYTES:
+            return await ctx.send(
+                f"Arquivo grande demais ({anexo.size} bytes). "
+                f"Máximo: {MAX_COOKIES_BYTES} bytes."
+            )
+
+        try:
+            raw = await anexo.read()
+        except discord.HTTPException as e:
+            log.warning("Erro ao ler anexo de cookies: %s", e)
+            return await ctx.send("Não consegui ler o arquivo anexado.")
+
+        texto = raw.decode("utf-8", errors="replace")
+        if not _looks_like_cookies(texto):
+            return await ctx.send(
+                "O arquivo não parece um `cookies.txt` do YouTube "
+                "(formato Netscape, exportado de uma sessão logada)."
+            )
+
+        try:
+            _write_cookies_file(texto)
+        except OSError as e:
+            log.error("Erro ao gravar cookies.txt: %s", e)
+            return await ctx.send("Não consegui salvar os cookies. Veja o log.")
+
+        log.info("cookies.txt atualizado por %s (%d bytes)", ctx.author, len(raw))
+        await ctx.send(
+            "Cookies do YouTube atualizados. Vou usá-los nas próximas buscas."
+        )
 
     @commands.command(aliases=["mlist", "mlinks", "links"])
     async def musiclinks(self, ctx: commands.Context):

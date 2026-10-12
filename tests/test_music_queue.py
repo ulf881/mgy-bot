@@ -343,7 +343,7 @@ def test_resolve_track_refreshes_stale_url(monkeypatch):
     track.stream_url = "https://c.example.com/v?expire=%d" % (int(time.time()) - 60)
     track.resolved_at = time.monotonic()
 
-    async def fake_extract(query, idle_timeout, max_timeout, abort_event):
+    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True):
         return {"url": "https://campo.example.com/v?expire=%d" % (int(time.time()) + 3600), "title": "nova"}
 
     monkeypatch.setattr(music, "_extract_info_isolated", fake_extract)
@@ -394,3 +394,331 @@ def test_on_track_end_no_retry_when_played_long(monkeypatch):
 
     assert state.current.query == "next"
     assert state.queue == []
+
+
+def test_is_bot_check():
+    assert music._is_bot_check("ERROR: Sign in to confirm you're not a bot")
+    assert music._is_bot_check("LOGIN_REQUIRED")
+    assert not music._is_bot_check("Video unavailable")
+    assert not music._is_bot_check("")
+
+
+def test_parse_cookie_header_filters_domains():
+    text = (
+        "# Netscape HTTP Cookie File\n"
+        ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tlogin-sid\n"
+        ".youtube.com\tTRUE\t/\tTRUE\t0\tVISITOR_INFO1_LIVE\tvisitor\n"
+        ".example.com\tTRUE\t/\tTRUE\t0\tSID\tother\n"
+    )
+    header = music._parse_cookie_header(text)
+    assert "SID=login-sid" in header
+    assert "VISITOR_INFO1_LIVE=visitor" in header
+    assert "other" not in header
+
+
+def test_looks_like_cookies():
+    good = (
+        "# Netscape HTTP Cookie File\n"
+        ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tlogin-sid\n"
+    )
+    assert music._looks_like_cookies(good)
+    assert not music._looks_like_cookies("")
+    assert not music._looks_like_cookies("some random text")
+    # youtube.com mas sem cookie de login do YouTube
+    assert not music._looks_like_cookies(
+        "youtube.com\n.youtube.com\tTRUE\t/\tTRUE\t0\tVISITOR_INFO1_LIVE\tx\n"
+    )
+
+
+def _fake_extract_data():
+    return {
+        "url": "https://c.example.com/v?expire=%d" % (int(time.time()) + 3600),
+        "title": "ok",
+    }
+
+
+def test_resolve_track_uses_cookies_when_available(monkeypatch):
+    cog = make_cog(monkeypatch)
+    track = music.Track("song")
+    monkeypatch.setattr(music, "_has_login_cookies", lambda: True)
+    monkeypatch.setattr(music, "_cookies_rejected_for_current_file", lambda: False)
+
+    calls = []
+
+    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True):
+        calls.append(use_cookies)
+        return _fake_extract_data()
+
+    monkeypatch.setattr(music, "_extract_info_isolated", fake_extract)
+
+    asyncio.run(cog._resolve_track(track))
+
+    assert calls == [True]
+
+
+def test_resolve_track_skips_cookies_when_rejected(monkeypatch):
+    cog = make_cog(monkeypatch)
+    track = music.Track("song")
+    monkeypatch.setattr(music, "_has_login_cookies", lambda: True)
+    monkeypatch.setattr(music, "_cookies_rejected_for_current_file", lambda: True)
+
+    calls = []
+
+    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True):
+        calls.append(use_cookies)
+        return _fake_extract_data()
+
+    monkeypatch.setattr(music, "_extract_info_isolated", fake_extract)
+
+    asyncio.run(cog._resolve_track(track))
+
+    assert calls == [False]
+
+
+def test_resolve_track_falls_back_without_cookies(monkeypatch):
+    cog = make_cog(monkeypatch)
+    track = music.Track("song")
+    monkeypatch.setattr(music, "_has_login_cookies", lambda: True)
+    monkeypatch.setattr(music, "_cookies_rejected_for_current_file", lambda: False)
+    monkeypatch.setattr(music, "_mark_cookies_rejected", lambda: True)
+
+    calls = []
+
+    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True):
+        calls.append(use_cookies)
+        if use_cookies:
+            raise music.BotCheckError("sign in to confirm")
+        return _fake_extract_data()
+
+    monkeypatch.setattr(music, "_extract_info_isolated", fake_extract)
+
+    asyncio.run(cog._resolve_track(track))
+
+    assert calls == [True, False]
+    assert track.title == "ok"
+
+
+def test_resolve_track_reraises_bot_check_without_cookies(monkeypatch):
+    cog = make_cog(monkeypatch)
+    track = music.Track("song")
+    monkeypatch.setattr(music, "_has_login_cookies", lambda: False)
+
+    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True):
+        raise music.BotCheckError("sign in to confirm")
+
+    monkeypatch.setattr(music, "_extract_info_isolated", fake_extract)
+
+    raised = False
+    try:
+        asyncio.run(cog._resolve_track(track))
+    except music.BotCheckError:
+        raised = True
+    assert raised
+
+
+def test_write_cookies_file_updates_cache(monkeypatch, tmp_path):
+    path = tmp_path / "cookies.txt"
+    monkeypatch.setattr(music, "COOKIES_FILE", str(path))
+    monkeypatch.setattr(music, "_cookie_cache", {"mtime": None, "value": ""})
+    monkeypatch.setattr(music, "_cookies_rejected", {"mtime": 123})
+
+    text = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tlogin-sid\n"
+    music._write_cookies_file(text)
+
+    assert path.read_text() == text
+    assert not (tmp_path / "cookies.txt.tmp").exists()
+    assert music._cookies_rejected["mtime"] is None
+    assert "SID=login-sid" in music._extract_cookie_header(str(path))
+    assert music._has_login_cookies() is True
+
+
+def test_has_login_cookies_false_without_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(music, "COOKIES_FILE", str(tmp_path / "missing.txt"))
+    assert music._has_login_cookies() is False
+
+
+def test_advance_locked_skips_track_on_bot_check(monkeypatch):
+    cog = make_cog(monkeypatch)
+    state = cog._state(1)
+    state.voice = FakeVoice()
+    state.queue = [music.Track("blocked"), music.Track("ok")]
+
+    async def fake_resolve(track, **kwargs):
+        if track.query == "blocked":
+            raise music.BotCheckError("sign in to confirm")
+        return _fake_resolved(track, **kwargs)
+
+    cog._resolve_track = fake_resolve
+    cog._build_source = lambda track, state, extra_before="": FakeSource()
+
+    asyncio.run(cog._advance_locked(1, state))
+
+    assert state.current.query == "ok"
+    assert state.queue == []
+
+
+def test_announce_shows_cookies_hint_when_rejected(monkeypatch):
+    cog = make_cog(monkeypatch)
+    state = cog._state(1)
+    track = music.Track("song")
+    track.title = "song"
+    track.webpage_url = "https://youtu.be/x"
+    track.duration = 10
+
+    sent = []
+
+    class FakeChannel:
+        async def send(self, embed=None, **kwargs):
+            sent.append(embed)
+            return "msg"
+
+    state.channel = FakeChannel()
+    monkeypatch.setattr(music, "guild_macro", lambda gid: "Fake")
+    monkeypatch.setattr(music, "_cookies_rejected_for_current_file", lambda: True)
+
+    asyncio.run(cog._announce_locked(1, state, track))
+
+    assert sent and "mgy cookies" in sent[0].description
+
+
+def test_announce_hides_cookies_hint_when_ok(monkeypatch):
+    cog = make_cog(monkeypatch)
+    state = cog._state(1)
+    track = music.Track("song")
+    track.title = "song"
+    track.webpage_url = "https://youtu.be/x"
+    track.duration = 10
+
+    sent = []
+
+    class FakeChannel:
+        async def send(self, embed=None, **kwargs):
+            sent.append(embed)
+            return "msg"
+
+    state.channel = FakeChannel()
+    monkeypatch.setattr(music, "guild_macro", lambda gid: "Fake")
+    monkeypatch.setattr(music, "_cookies_rejected_for_current_file", lambda: False)
+
+    asyncio.run(cog._announce_locked(1, state, track))
+
+    assert sent and "mgy cookies" not in sent[0].description
+
+
+class FakeEmbed:
+    def __init__(self, description=""):
+        self.description = description
+
+
+class FakeMessage:
+    def __init__(self, embed):
+        self.embeds = [embed]
+        self.edits = []
+
+    async def edit(self, embed=None, **kwargs):
+        self.edits.append(embed)
+        self.embeds = [embed]
+
+
+class FakeTypingChannel:
+    def __init__(self):
+        self.entered = 0
+        self.exited = 0
+
+    def typing(self):
+        outer = self
+
+        class _CM:
+            async def __aenter__(self):
+                outer.entered += 1
+
+            async def __aexit__(self, *args):
+                outer.exited += 1
+
+        return _CM()
+
+
+def test_resolve_track_marks_rejected_when_fallback_fails(monkeypatch):
+    cog = make_cog(monkeypatch)
+    track = music.Track("song")
+    monkeypatch.setattr(music, "_has_login_cookies", lambda: True)
+    monkeypatch.setattr(music, "_cookies_rejected_for_current_file", lambda: False)
+
+    marked = []
+    monkeypatch.setattr(music, "_mark_cookies_rejected", lambda: marked.append(1) or True)
+
+    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True):
+        raise music.BotCheckError("sign in to confirm")
+
+    monkeypatch.setattr(music, "_extract_info_isolated", fake_extract)
+
+    raised = False
+    try:
+        asyncio.run(cog._resolve_track(track))
+    except music.BotCheckError:
+        raised = True
+
+    assert raised
+    assert marked == [1]  # marcou os cookies mesmo com o fallback falhando
+
+
+def test_edit_now_playing_cookies_warning(monkeypatch):
+    cog = make_cog(monkeypatch)
+    state = cog._state(1)
+    msg = FakeMessage(FakeEmbed("tocando agora"))
+    state.now_playing = msg
+
+    asyncio.run(cog._edit_now_playing_cookies_warning(state))
+    assert len(msg.edits) == 1
+    assert "mgy cookies" in msg.edits[0].description
+
+    # Nao duplica o aviso se chamado de novo.
+    asyncio.run(cog._edit_now_playing_cookies_warning(state))
+    assert len(msg.edits) == 1
+
+
+def test_edit_now_playing_cookies_warning_without_message(monkeypatch):
+    cog = make_cog(monkeypatch)
+    state = cog._state(1)
+    state.now_playing = None
+    asyncio.run(cog._edit_now_playing_cookies_warning(state))  # nao deve explodir
+
+
+def test_resolve_for_playback_shows_typing(monkeypatch):
+    cog = make_cog(monkeypatch)
+    state = cog._state(1)
+    channel = FakeTypingChannel()
+    state.channel = channel
+
+    calls = []
+
+    async def fake_resolve(track, **kwargs):
+        calls.append(track.query)
+        return _fake_resolved(track, **kwargs)
+
+    cog._resolve_track = fake_resolve
+
+    asyncio.run(cog._resolve_for_playback(state, music.Track("x")))
+
+    assert channel.entered == 1
+    assert channel.exited == 1
+    assert calls == ["x"]
+
+
+def test_advance_locked_edits_embed_on_bot_check(monkeypatch):
+    cog = make_cog(monkeypatch)
+    state = cog._state(1)
+    state.voice = FakeVoice()
+    state.queue = [music.Track("blocked")]
+    msg = FakeMessage(FakeEmbed("tocando agora"))
+    state.now_playing = msg
+
+    async def fake_resolve(track, **kwargs):
+        raise music.BotCheckError("sign in to confirm")
+
+    cog._resolve_track = fake_resolve
+
+    asyncio.run(cog._advance_locked(1, state))
+
+    assert msg.edits
+    assert "mgy cookies" in msg.edits[0].description

@@ -11,6 +11,7 @@ test.py
 sandbox/
 .env
 cookies.txt
+cookies.txt.tmp
 database-backup.sql
 
 # Local environment / machine-specific
