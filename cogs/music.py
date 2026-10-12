@@ -101,10 +101,16 @@ BROWSER_HEADERS = {
 }
 
 # Ordem importa: o yt-dlp tenta os clientes na ordem e usa o primeiro que
-# retorna formatos. web_embedded/web estao passando por PO token + JS
-# challenges (demorados e as vezes travados via deno); android/ios/tv/mweb
-# na maioria das vezes extraem direto, sem desafio.
-YOUTUBE_PLAYER_CLIENTS = ["android", "ios", "tv", "mweb", "web_embedded", "web"]
+# retorna formatos. visionos e web_embedded nao exigem PO token (o visionos
+# nem JS player), entao ficam na frente; tv_downgraded/web suportam cookies.
+# android/ios saem da lista: hoje exigem PO token e nao suportam cookies
+# (yt-dlp os descarta quando ha login). Isso segue os defaults de 2026.
+YOUTUBE_PLAYER_CLIENTS = ["visionos", "web_embedded", "tv_downgraded", "web"]
+
+# Cookies de login do YouTube expiram/rotacionam com o tempo; o sintoma de
+# cookies ausentes/expirados e o "Sign in to confirm you're not a bot".
+COOKIE_STALE_DAYS = 30
+_YOUTUBE_LOGIN_COOKIES = ("SID=", "SAPISID=", "__Secure-1PSID=", "__Secure-3PSID=")
 
 YTDLP_JS_RUNTIMES = [
     runtime.strip()
@@ -309,6 +315,58 @@ def _extract_cookie_header(path: str) -> str:
     return value
 
 
+_cookie_status_key = object()
+
+
+def _log_cookie_status_once() -> None:
+    """Avisa (uma vez por versao do arquivo) se os cookies parecem ausentes.
+
+    O YouTube exige login em IPs de VPS; sem cookies validos a extracao falha
+    com "Sign in to confirm you're not a bot". Vale avisar no log em vez de
+    deixar so o erro cru do yt-dlp.
+    """
+    global _cookie_status_key
+    try:
+        mtime = os.path.getmtime(COOKIES_FILE)
+    except OSError:
+        mtime = None
+
+    if _cookie_status_key == mtime:
+        return
+    _cookie_status_key = mtime
+
+    if mtime is None:
+        log.warning(
+            "cookies.txt nao encontrado (%s): o YouTube pode exigir login e "
+            "falhar com 'Sign in to confirm you're not a bot'.",
+            COOKIES_FILE,
+        )
+        return
+
+    header = _extract_cookie_header(COOKIES_FILE)
+    if not any(name in header for name in _YOUTUBE_LOGIN_COOKIES):
+        log.warning(
+            "cookies.txt (%s) nao contem cookies de login do YouTube; o bot "
+            "provavelmente vai falhar com 'Sign in to confirm you're not a bot'.",
+            COOKIES_FILE,
+        )
+        return
+
+    age_days = (time.time() - mtime) / 86400
+    if age_days >= COOKIE_STALE_DAYS:
+        log.warning(
+            "cookies.txt tem ~%.0f dias; se o YouTube pedir login, exporte "
+            "cookies novos de uma sessao logada.",
+            age_days,
+        )
+
+
+def _is_bot_check(text: str) -> bool:
+    """True quando o erro do yt-dlp e o pedido de login do YouTube (bot check)."""
+    lowered = (text or "").lower()
+    return "sign in to confirm" in lowered or "login_required" in lowered
+
+
 def _build_ffmpeg_headers(data: dict) -> dict:
     """Constroi headers similares a um navegador para URLs do GoogleVideo."""
     headers = dict(BROWSER_HEADERS)
@@ -367,6 +425,7 @@ async def _extract_info_isolated(
     ]
     if os.path.exists(COOKIES_FILE):
         command.extend(["--cookies", COOKIES_FILE])
+    _log_cookie_status_once()
     if YTDLP_JS_RUNTIMES:
         command.append("--no-js-runtimes")
         for runtime in YTDLP_JS_RUNTIMES:
@@ -489,12 +548,20 @@ async def _extract_info_isolated(
 
     if process.returncode != 0:
         error = _stderr_tail()
-        log.error(
-            "yt-dlp exited with %s for %s. Ultimas linhas:\n%s",
-            process.returncode,
-            url,
-            error,
-        )
+        if _is_bot_check(error):
+            log.error(
+                "YouTube exigiu login (bot check) para %s. Renove o "
+                "cookies.txt com uma sessao logada do YouTube. Ultimas linhas:\n%s",
+                url,
+                error,
+            )
+        else:
+            log.error(
+                "yt-dlp exited with %s for %s. Ultimas linhas:\n%s",
+                process.returncode,
+                url,
+                error,
+            )
         raise RuntimeError(error or f"yt-dlp exited with {process.returncode}")
 
     try:
