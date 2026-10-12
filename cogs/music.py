@@ -633,6 +633,23 @@ def _is_url(value: str) -> bool:
         return False
 
 
+def _parse_timestamp(value: str) -> int | None:
+    """Converte ``ss``, ``mm:ss`` ou ``hh:mm:ss`` em segundos.
+
+    Sem ``:`` o valor e tratado como segundos; com uma secao como ``mm:ss``;
+    com duas como ``hh:mm:ss``. Retorna ``None`` para formato invalido
+    (partes nao numericas ou mais de tres secoes).
+    """
+    parts = [part.strip() for part in (value or "").split(":")]
+    if len(parts) > 3 or any(not part.isdigit() for part in parts):
+        return None
+
+    total = 0
+    for part in parts:
+        total = total * 60 + int(part)
+    return total
+
+
 def _load_mashups() -> list[str]:
     """Le os links de mashup do Dropbox.html uma unica vez."""
     global _mashups_cache
@@ -1393,11 +1410,19 @@ class Music(commands.Cog):
         await self._change_volume(ctx, args, global_scope=False)
 
     @commands.command(aliases=["ff", "fastforward"])
-    async def fast_forward(self, ctx: commands.Context, seconds: int):
-        """Avança o áudio atual por um número específico de segundos.
+    async def fast_forward(self, ctx: commands.Context, tempo: str):
+        """Avança o áudio para um tempo específico do video.
 
-        Sempre é considerado a partir do inicio do video.
+        Aceita `ss`, `mm:ss` ou `hh:mm:ss` (ex.: `mgy ff 90`, `mgy ff 1:30`,
+        `mgy ff 0:01:30`). O tempo e contado a partir do inicio do video.
         """
+        seconds = _parse_timestamp(tempo)
+        if seconds is None:
+            return await ctx.send(
+                "Tempo inválido. Use `ss`, `mm:ss` ou `hh:mm:ss` "
+                "(ex.: `mgy ff 90`, `mgy ff 1:30`, `mgy ff 0:01:30`)."
+            )
+
         state = self._state(ctx.guild.id)
         state.channel = ctx.channel
         if not state.voice or not state.current:

@@ -133,6 +133,25 @@ def test_is_url():
     assert not music._is_url("")
 
 
+def test_parse_timestamp():
+    assert music._parse_timestamp("90") == 90
+    assert music._parse_timestamp("1:30") == 90
+    assert music._parse_timestamp("0:01:30") == 90
+    assert music._parse_timestamp("1:02:03") == 3723
+    assert music._parse_timestamp(" 2:00 ") == 120
+    assert music._parse_timestamp("0") == 0
+
+
+def test_parse_timestamp_invalid():
+    assert music._parse_timestamp("") is None
+    assert music._parse_timestamp("abc") is None
+    assert music._parse_timestamp("1:") is None
+    assert music._parse_timestamp(":30") is None
+    assert music._parse_timestamp("1:2:3:4") is None
+    assert music._parse_timestamp("1:a") is None
+    assert music._parse_timestamp("-30") is None
+
+
 def test_build_source_wraps_in_volume_transformer(monkeypatch):
     """source precisa ser um PCMVolumeTransformer, senao _apply_volume nao faz nada."""
     cog = make_cog(monkeypatch)
