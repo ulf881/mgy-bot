@@ -15,6 +15,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -133,7 +134,10 @@ ytdl_format_options = {
 }
 
 ffmpeg_options = {
-    "before_options": "-nostdin -hide_banner -loglevel error -re -probesize 256k -analyzeduration 0 -rw_timeout 15000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_max_retries 3",
+    # -re foi removido: com ele o ffmpeg le a entrada no ritmo real, sem
+    # ler adiante, e qualquer lentidao inicial do servidor vira lag nos
+    # primeiros ~30s. Sem -re o ffmpeg avanca na rede e pre-enche o buffer.
+    "before_options": "-nostdin -hide_banner -loglevel error -probesize 256k -analyzeduration 0 -rw_timeout 15000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_max_retries 3",
     "options": "-vn -sn -dn -threads 1 -filter_threads 1 -filter_complex_threads 1 -nostats",
 }
 
@@ -362,6 +366,12 @@ async def _extract_info_isolated(
         for runtime in YTDLP_JS_RUNTIMES:
             command.extend(["--js-runtimes", runtime])
     command.append(url)
+
+    # O yt-dlp (e o deno que ele spawna para resolver JS challenges do
+    # YouTube) roda em prioridade menor que o ffmpeg, para nao roubar CPU
+    # do audio durante a resolucao do prefetch.
+    if sys.platform != "win32" and shutil.which("nice"):
+        command = ["nice", "-n", "10", *command]
 
     process = await asyncio.create_subprocess_exec(
         *command,
