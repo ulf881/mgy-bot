@@ -143,13 +143,7 @@ ffmpeg_options = {
     # -re foi removido: com ele o ffmpeg le a entrada no ritmo real, sem
     # ler adiante, e qualquer lentidao inicial do servidor vira lag nos
     # primeiros ~30s. Sem -re o ffmpeg avanca na rede e pre-enche o buffer.
-    # -http_persistent 0: nos HLS do YouTube a URL alterna entre dois hosts
-    # (rr2/rr5) com keepalive; a reutilizacao de conexao falha a cada
-    # segmento ("Cannot reuse HTTP connection for different host" + "keepalive
-    # request failed ... retrying with new connection"), atrasando o audio.
-    # Desligando o reuse o ffmpeg abre conexao nova direto, sem a tentativa
-    # falha e sem o spam de erros.
-    "before_options": "-nostdin -hide_banner -loglevel error -probesize 256k -analyzeduration 0 -http_persistent 0 -rw_timeout 15000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_max_retries 3",
+    "before_options": "-nostdin -hide_banner -loglevel error -probesize 256k -analyzeduration 0 -rw_timeout 15000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_max_retries 3",
     "options": "-vn -sn -dn -threads 1 -filter_threads 1 -filter_complex_threads 1 -nostats",
 }
 
