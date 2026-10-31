@@ -25,7 +25,7 @@ import discord
 import googleapiclient.discovery
 from bs4 import BeautifulSoup
 from discord.ext import commands, tasks
-from sandbox.spotify_playlist import playlist_tracks
+from utils.spotify_fetch import playlist_tracks
 from utils.config import (
     AVATAR_URL,
     BONUS_ROOM_TITLE,

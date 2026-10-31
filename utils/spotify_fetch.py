@@ -1,9 +1,9 @@
-"""Driverless Spotify playlist fetcher (TOTP flow).
+"""Driverless Spotify playlist fetcher.
 
-Gets an anonymous web-player access token via the TOTP flow against
-open.spotify.com/api/token, then paginates the private GraphQL endpoint
-api-partner.spotify.com/pathfinder/v2/query (fetchPlaylist) to return the
-full track list of a public playlist.
+Gets an anonymous web-player access token (no browser, no API key) via the
+TOTP flow against open.spotify.com/api/token, then paginates the private
+GraphQL endpoint api-partner.spotify.com/pathfinder/v2/query (fetchPlaylist)
+to return the full track list of a public playlist.
 
 Returns a list of "Artist Trackname" strings, just like the spotipy code.
 """
@@ -11,7 +11,6 @@ Returns a list of "Artist Trackname" strings, just like the spotipy code.
 import base64
 import hashlib
 import hmac
-import logging
 import re
 import struct
 import time
@@ -19,18 +18,13 @@ import uuid
 
 from curl_cffi import requests
 
-log = logging.getLogger("music")
-
-IMPERSONATE = "chrome131"
+IMPRESONATE = "chrome131"
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 PATHFINDER_URL = "https://api-partner.spotify.com/pathfinder/v2/query"
 TOKEN_URL = "https://open.spotify.com/api/token"
-SERVER_TIME_URL = "https://open.spotify.com/api/server-time"
-CLIENT_TOKEN_URL = "https://clienttoken.spotify.com/v1/clienttoken"
-CLIENT_VERSION = "1.2.87.28.g9713df8f"
 
 # Known-good persisted-query hash. When Spotify rolls the web-player build
 # this is re-scraped live; kept as fallback if scraping fails.
@@ -67,14 +61,13 @@ def _hotp(b32_secret: str, counter: int) -> str:
 
 
 def _totp_at(b32_secret: str, ts: int) -> str:
-    # ts vem em milissegundos do /api/server-time
-    return _hotp(b32_secret, (ts // 1000) // 30)
+    return _hotp(b32_secret, ts // 30)
 
 
 def _fetch_secret_dict() -> dict:
     for url in SECRET_SOURCES:
         try:
-            r = requests.get(url, timeout=10, impersonate=IMPERSONATE)
+            r = requests.get(url, timeout=10)
             data = r.json()
             if isinstance(data, dict) and data:
                 return data
@@ -99,7 +92,7 @@ def _generate_totp(secret_dict: dict) -> tuple[str, str]:
 def _access_token(session) -> dict:
     """Anonymous web-player access token via the TOTP flow."""
     server_time = session.get(
-        SERVER_TIME_URL, impersonate=IMPERSONATE
+        "https://open.spotify.com/api/server-time", impersonate=IMPRESONATE
     ).json()["serverTime"]
 
     version, b32_secret = _generate_totp(_fetch_secret_dict())
@@ -114,7 +107,7 @@ def _access_token(session) -> dict:
     }
     if int(version) < 10:
         client_time = int(time.time() * 1000)
-        build_date = time.strftime("%Y-%m-%d", time.gmtime(server_time / 1000))
+        build_date = time.strftime("%Y-%m-%d", time.gmtime(server_time))
         params.update({
             "sTime": server_time,
             "cTime": client_time,
@@ -128,7 +121,7 @@ def _access_token(session) -> dict:
         "Referer": "https://open.spotify.com/",
         "App-Platform": "WebPlayer",
     }
-    r = session.get(TOKEN_URL, params=params, headers=headers, impersonate=IMPERSONATE)
+    r = session.get(TOKEN_URL, params=params, headers=headers, impersonate=IMPRESONATE)
     if r.status_code != 200:
         raise RuntimeError(f"Token request failed: {r.status_code} {r.text[:200]}")
     return r.json()
@@ -137,7 +130,7 @@ def _access_token(session) -> dict:
 def _client_token(session, client_id: str, device_id: str) -> str:
     payload = {
         "client_data": {
-            "client_version": CLIENT_VERSION,
+            "client_version": "1.2.87.28.g9713df8f",
             "client_id": client_id,
             "js_sdk_data": {
                 "device_brand": "unknown",
@@ -157,8 +150,8 @@ def _client_token(session, client_id: str, device_id: str) -> str:
         "user-agent": UA,
     }
     r = session.post(
-        CLIENT_TOKEN_URL,
-        json=payload, headers=headers, impersonate=IMPERSONATE,
+        "https://clienttoken.spotify.com/v1/clienttoken",
+        json=payload, headers=headers, impersonate=IMPRESONATE,
     )
     return r.json()["granted_token"]["token"]
 
@@ -170,7 +163,7 @@ def _fetchplaylist_hash(session) -> str:
         re.findall(r"https://open\.spotifycdn\.com/cdn/build/web-player/[^\"\\']+\.js", html)
     ))
     for url in bundles:
-        bundle = session.get(url, impersonate=IMPERSONATE).text
+        bundle = session.get(url, impersonate=IMPRESONATE).text
         m = re.search(r'"fetchPlaylist","query","([0-9a-f]{64})"', bundle)
         if m:
             return m.group(1)
@@ -178,7 +171,7 @@ def _fetchplaylist_hash(session) -> str:
 
 
 def _headers(playlist_id: str) -> dict:
-    session = requests.Session(impersonate=IMPERSONATE)
+    session = requests.Session(impersonate=IMPRESONATE)
     session.get(f"https://open.spotify.com/playlist/{playlist_id}")
 
     token = _access_token(session)
@@ -209,7 +202,7 @@ def playlist_tracks(playlist_id: str, limit: int = 100) -> list[str]:
         playlist_id = match.group(1)
 
     headers = _headers(playlist_id)
-    session = requests.Session(impersonate=IMPERSONATE)
+    session = requests.Session(impersonate=IMPRESONATE)
 
     try:
         fetch_hash = _fetchplaylist_hash(session)
@@ -230,7 +223,7 @@ def playlist_tracks(playlist_id: str, limit: int = 100) -> list[str]:
             "extensions": {"persistedQuery": {"version": 1, "sha256Hash": fetch_hash}},
         }
         r = session.post(
-            PATHFINDER_URL, json=payload, headers=headers, impersonate=IMPERSONATE
+            PATHFINDER_URL, json=payload, headers=headers, impersonate=IMPRESONATE
         )
         if r.status_code != 200:
             # Hash might have rotated between scrape and request; retry once.
@@ -238,7 +231,7 @@ def playlist_tracks(playlist_id: str, limit: int = 100) -> list[str]:
                 payload["extensions"]["persistedQuery"]["sha256Hash"] = FALLBACK_FETCHPLAYLIST_HASH
                 r = session.post(
                     PATHFINDER_URL, json=payload, headers=headers,
-                    impersonate=IMPERSONATE,
+                    impersonate=IMPRESONATE,
                 )
         if r.status_code != 200:
             raise RuntimeError(f"Pathfinder error {r.status_code}: {r.text[:300]}")
@@ -264,3 +257,14 @@ def playlist_tracks(playlist_id: str, limit: int = 100) -> list[str]:
 
     session.close()
     return tracks
+
+
+if __name__ == "__main__":
+    all_tracks = playlist_tracks("3rT9xc86BIZWNAT42nGI8T")
+    print(f"\nTotal: {len(all_tracks)} tracks")
+    print("\nFirst 5:")
+    for t in all_tracks[:5]:
+        print("  ", t)
+    print("\nLast 5:")
+    for t in all_tracks[-5:]:
+        print("  ", t)
