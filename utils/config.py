@@ -27,7 +27,7 @@ FROTA_IMAGE_URL = "https://i.imgur.com/dvWqqcz.png"
 DROWN_IMAGE_URL = "https://i.imgur.com/dsUPTgY.png"
 
 # Limite maximo de itens que podem ser adicionados de uma vez na fila
-MAX_QUEUE = 500
+MAX_QUEUE = 2000
 
 # Intervalo (segundos) entre ganhos de XP por usuario
 XP_DELAY_SECONDS = 45
