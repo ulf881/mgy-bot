@@ -23,11 +23,9 @@ from urllib.parse import parse_qs, urlparse
 
 import discord
 import googleapiclient.discovery
-import spotipy
 from bs4 import BeautifulSoup
 from discord.ext import commands, tasks
-from spotipy.oauth2 import SpotifyClientCredentials
-
+from sandbox.spotify_playlist import playlist_tracks
 from utils.config import (
     AVATAR_URL,
     BONUS_ROOM_TITLE,
@@ -164,12 +162,6 @@ ffmpeg_options = {
     "options": "-vn -sn -dn -threads 1 -filter_threads 1 -filter_complex_threads 1 -nostats",
 }
 
-sp = spotipy.Spotify(
-    auth_manager=SpotifyClientCredentials(
-        client_id=os.environ["SPOTIPY_CLIENT_ID"],
-        client_secret=os.environ["SPOTIPY_CLIENT_SECRET"],
-    )
-)
 youtube = googleapiclient.discovery.build(
     "youtube",
     "v3",
@@ -399,7 +391,9 @@ def _cookies_rejected_for_current_file() -> bool:
         mtime = os.path.getmtime(COOKIES_FILE)
     except OSError:
         return False
-    return _cookies_rejected["mtime"] is not None and _cookies_rejected["mtime"] == mtime
+    return (
+        _cookies_rejected["mtime"] is not None and _cookies_rejected["mtime"] == mtime
+    )
 
 
 def _mark_cookies_rejected() -> bool:
@@ -918,7 +912,9 @@ class Music(commands.Cog):
                     await asyncio.sleep(VOICE_RECONNECT_DELAY_SECONDS)
         return False
 
-    async def _reconnect_voice(self, guild_id: int, channel: discord.VoiceChannel | None):
+    async def _reconnect_voice(
+        self, guild_id: int, channel: discord.VoiceChannel | None
+    ):
         """Tenta voltar ao canal apos uma queda e retomar a fila."""
         state = self._state(guild_id)
         try:
@@ -1099,7 +1095,6 @@ class Music(commands.Cog):
             return
         await self._disconnect_nolock(guild_id, state)
 
-
     def _make_after(self, guild_id: int, generation: int):
         def after(error):
             if error:
@@ -1229,35 +1224,15 @@ class Music(commands.Cog):
     # Coleta de playlists
     # ------------------------------------------------------------------
     async def _spotify_tracks(self, url: str) -> list[Track]:
-        """Separa musicas da playlist usando a api do spotify."""
+        """Separa musicas da playlist usando o fetcher driverless (TOTP)."""
         log.info("Buscando playlist do spotify: %s", url)
+        try:
+            names = await asyncio.to_thread(playlist_tracks, url)
+        except Exception as exc:
+            log.error("Falha ao buscar playlist do spotify: %s", exc)
+            return []
 
-        response = await asyncio.to_thread(
-            sp.playlist_tracks,
-            url,
-            limit=50,
-            offset=0,
-            fields="items.track.name,items.track.artists.name",
-        )
-        tracks = response["items"]
-        offset = 0
-        while len(response["items"]) >= 50:
-            offset += 50
-            response = await asyncio.to_thread(
-                sp.playlist_tracks,
-                url,
-                offset=offset,
-                limit=50,
-                fields="items.track.name,items.track.artists.name",
-            )
-            tracks.extend(response["items"])
-
-        result = []
-        for item in tracks:
-            artist = item["track"]["artists"][0]["name"]
-            name = item["track"]["name"]
-            result.append(Track(f"{artist} {name}", is_search=True))
-        return result
+        return [Track(name, is_search=True) for name in names]
 
     async def _youtube_playlist(self, url: str) -> list[Track]:
         """Separa musicas da playlist usando a api do youtube v3."""
