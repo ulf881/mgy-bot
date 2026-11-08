@@ -52,13 +52,17 @@ YTDLP_MAX_TIMEOUT_SECONDS = 900
 # Intervalo de checagem do yt-dlp: curto para reagir rapido a skip/stop
 # (abort) e para medir a inatividade com precisao.
 YTDLP_POLL_INTERVAL_SECONDS = 1.0
-# Prioridade (nice) do yt-dlp e do deno que ele spawna: quanto maior, menor a
-# prioridade de CPU, para nao competir com o ffmpeg durante a resolucao.
-YTDLP_NICE_LEVEL = 15
 # Reconexao de voz: quantas tentativas e quanto esperar entre elas.
 VOICE_CONNECT_ATTEMPTS = 3
 VOICE_RECONNECT_DELAY_SECONDS = 2.0
 MAX_RESOLVE_ATTEMPTS = 10
+# Teto de tempo total para resolver as proximas faixas de uma guild. Sem isso,
+# MAX_RESOLVE_ATTEMPTS x timeout por faixa (~90s) deixava a guild "digitando"
+# por ~15 min e segurando o unico slot de extracao das outras guilds.
+RESOLVE_TOTAL_BUDGET_SECONDS = 120
+# Teto de espera pelo slot global. Se outra extracao travar, o playback desiste
+# em vez de esperar para sempre.
+EXTRACT_SLOT_WAIT_SECONDS = 120
 MASHUP_SCAN_LIMIT = 100
 # Validade das stream URLs: lemos o vencimento exato do campo "expire" que o
 # proprio googlevideo embute na URL. A idade maxima so e usada como fallback
@@ -111,11 +115,11 @@ YTDLP_MAX_CONCURRENT = _env_int("YTDLP_MAX_CONCURRENT", 1, minimum=1)
 # durante uma extracao, o yt-dlp e morto em vez de empurrar a maquina para o
 # swap. 0 desativa. Sem /proc a checagem e ignorada.
 YTDLP_MIN_AVAILABLE_MB = _env_int("YTDLP_MIN_AVAILABLE_MB", 64)
-# Tenta primeiro a extracao anonima (cliente visionos, sem JS challenge/deno)
-# e so cai para os cookies se o YouTube exigir login. Com cookies o yt-dlp
-# descarta o visionos e resolve em ~100s; anonimo costuma levar poucos
-# segundos. 0 forca sempre o caminho com cookies.
-YTDLP_PREFER_ANONYMOUS = bool(_env_int("YTDLP_PREFER_ANONYMOUS", 1))
+# Prioridade (nice) do yt-dlp e do runtime JS que ele spawna. Era 15, mas com
+# um unico core compartilhado isso deixava o yt-dlp sem CPU: ele nao imprimia
+# nada e o timeout de 90s matava a extracao. 5 ainda protege o ffmpeg sem
+# starvar a extracao. 0 desativa.
+YTDLP_NICE_LEVEL = _env_int("YTDLP_NICE_LEVEL", 5)
 
 # Uma extracao por vez no maximo; o prefetch usa try-acquire para nunca
 # segurar o unico slot enquanto outra guild quer comecar a tocar.
@@ -123,9 +127,6 @@ _extract_slots = asyncio.Semaphore(YTDLP_MAX_CONCURRENT)
 # Setado quando uma reproducao esta esperando o slot: o prefetch em andamento
 # se mata na hora para liberar a vaga (playback sempre tem prioridade).
 _prefetch_abort = asyncio.Event()
-# None = ainda nao sabemos; True = extracao anonima funciona; False = o IP
-# levou bot check anonimo e devemos ir direto para os cookies.
-_anon_mode: bool | None = None
 
 
 class ResolutionAborted(Exception):
@@ -429,12 +430,6 @@ def _is_bot_check(text: str) -> bool:
     return "sign in to confirm" in lowered or "login_required" in lowered
 
 
-def _is_age_restricted(text: str) -> bool:
-    """True para o erro de restricao de idade (login com cookies resolve)."""
-    lowered = (text or "").lower()
-    return "confirm your age" in lowered or "inappropriate for some users" in lowered
-
-
 def _has_login_cookies() -> bool:
     """True se o cookies.txt existe e tem cookies de login do YouTube."""
     try:
@@ -542,6 +537,7 @@ async def _acquire_extract_slot(
     log.info(
         "Aguardando slot de extracao yt-dlp (%s em uso)", YTDLP_MAX_CONCURRENT
     )
+    started = time.monotonic()
     # Reproducao tem prioridade: mata o prefetch que estiver segurando o slot.
     _prefetch_abort.set()
     try:
@@ -550,8 +546,17 @@ async def _acquire_extract_slot(
                 raise ResolutionAborted("slot")
             try:
                 await asyncio.wait_for(_extract_slots.acquire(), timeout=0.5)
+                waited = time.monotonic() - started
+                if waited >= 1:
+                    log.info("Slot de extracao liberado apos %.0fs", waited)
                 return
             except TimeoutError:
+                if time.monotonic() - started >= EXTRACT_SLOT_WAIT_SECONDS:
+                    log.warning(
+                        "Slot de extracao ocupado por %.0fs; desistindo desta faixa",
+                        EXTRACT_SLOT_WAIT_SECONDS,
+                    )
+                    raise TimeoutError("slot de extracao ocupado por muito tempo")
                 continue
     finally:
         _prefetch_abort.clear()
@@ -943,49 +948,14 @@ class Music(commands.Cog):
         use_cookies: bool,
         wait_for_slot: bool = True,
     ) -> dict:
-        """Extrai a faixa preferindo o modo que estiver funcionando.
+        """Extrai a faixa; se o login for recusado, tenta sem cookies.
 
-        Com cookies o yt-dlp descarta o cliente visionos e cai em clientes que
-        exigem resolver JS challenge (deno/qjs): a resolucao passava de ~100s
-        no log real. Sem cookies o visionos e usado (sem JS player) e costuma
-        resolver em poucos segundos. Por isso tentamos anonimo primeiro e so
-        usamos cookies quando o YouTube exige login. Se os cookies forem
-        recusados (bot check), voltamos para o modo anonimo e avisamos a Staff
-        (comando ``mgy cookies``).
+        Sem login o yt-dlp passa a usar clientes sem cookie (ex. visionos), o
+        que as vezes escapa do bot check. Marcamos os cookies atuais como ruins
+        assim que o login e recusado, para as proximas resolucoes irem direto no
+        modo sem cookies e para o embed avisar a Staff, ate o arquivo ser
+        trocado (comando ``mgy cookies``).
         """
-        global _anon_mode
-
-        tried_anon = False
-        if use_cookies and YTDLP_PREFER_ANONYMOUS and _anon_mode is not False:
-            tried_anon = True
-            try:
-                data = await _extract_info_isolated(
-                    track.query,
-                    idle_timeout,
-                    max_timeout,
-                    abort_event,
-                    use_cookies=False,
-                    wait_for_slot=wait_for_slot,
-                )
-            except BotCheckError as exc:
-                # Bot check ou video que exige login (idade): repete com cookies.
-                # So desliga o modo anonimo quando o IP foi sinalizado; a
-                # restricao de idade e por video.
-                if not _is_age_restricted(str(exc)):
-                    _anon_mode = False
-                log.warning(
-                    "Extracao anonima recusada para '%s'; tentando com cookies",
-                    track.query,
-                )
-            else:
-                if _anon_mode is not True:
-                    _anon_mode = True
-                    log.info(
-                        "Extracao anonima funcionando (sem cookies, sem JS "
-                        "challenge): resolucao mais rapida"
-                    )
-                return data
-
         try:
             return await _extract_info_isolated(
                 track.query,
@@ -998,18 +968,14 @@ class Music(commands.Cog):
         except BotCheckError:
             if not use_cookies:
                 raise
-            if _mark_cookies_rejected():
-                log.warning(
-                    "Cookies do YouTube recusados; extraindo sem cookies ate o "
-                    "cookies.txt ser atualizado (mgy cookies)"
-                )
-            if tried_anon:
-                # Ja gastamos a tentativa anonima nesta faixa: nao repetir.
-                raise
             log.warning(
                 "Cookies do YouTube recusados (bot check) para '%s'; tentando sem login",
                 track.query,
             )
+            if _mark_cookies_rejected():
+                log.warning(
+                    "Extraindo sem cookies ate o cookies.txt ser atualizado (mgy cookies)"
+                )
             return await _extract_info_isolated(
                 track.query,
                 idle_timeout,
