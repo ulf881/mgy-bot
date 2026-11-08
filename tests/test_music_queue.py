@@ -392,7 +392,7 @@ def test_resolve_track_refreshes_stale_url(monkeypatch):
     track.stream_url = "https://c.example.com/v?expire=%d" % (int(time.time()) - 60)
     track.resolved_at = time.monotonic()
 
-    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True):
+    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True, wait_for_slot=True):
         return {"url": "https://campo.example.com/v?expire=%d" % (int(time.time()) + 3600), "title": "nova"}
 
     monkeypatch.setattr(music, "_extract_info_isolated", fake_extract)
@@ -467,7 +467,7 @@ def test_resolve_track_uses_cookies_when_available(monkeypatch):
 
     calls = []
 
-    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True):
+    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True, wait_for_slot=True):
         calls.append(use_cookies)
         return _fake_extract_data()
 
@@ -486,7 +486,7 @@ def test_resolve_track_skips_cookies_when_rejected(monkeypatch):
 
     calls = []
 
-    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True):
+    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True, wait_for_slot=True):
         calls.append(use_cookies)
         return _fake_extract_data()
 
@@ -506,7 +506,7 @@ def test_resolve_track_falls_back_without_cookies(monkeypatch):
 
     calls = []
 
-    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True):
+    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True, wait_for_slot=True):
         calls.append(use_cookies)
         if use_cookies:
             raise music.BotCheckError("sign in to confirm")
@@ -525,7 +525,7 @@ def test_resolve_track_reraises_bot_check_without_cookies(monkeypatch):
     track = music.Track("song")
     monkeypatch.setattr(music, "_has_login_cookies", lambda: False)
 
-    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True):
+    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True, wait_for_slot=True):
         raise music.BotCheckError("sign in to confirm")
 
     monkeypatch.setattr(music, "_extract_info_isolated", fake_extract)
@@ -653,7 +653,7 @@ def test_resolve_track_marks_rejected_when_fallback_fails(monkeypatch):
     marked = []
     monkeypatch.setattr(music, "_mark_cookies_rejected", lambda: marked.append(1) or True)
 
-    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True):
+    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True, wait_for_slot=True):
         raise music.BotCheckError("sign in to confirm")
 
     monkeypatch.setattr(music, "_extract_info_isolated", fake_extract)

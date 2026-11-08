@@ -16,8 +16,10 @@ import os
 import random
 import re
 import shutil
+import signal
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, urlparse
 
@@ -25,7 +27,7 @@ import discord
 import googleapiclient.discovery
 from bs4 import BeautifulSoup
 from discord.ext import commands, tasks
-from utils.spotify_fetch import playlist_tracks
+
 from utils.config import (
     AVATAR_URL,
     BONUS_ROOM_TITLE,
@@ -35,6 +37,7 @@ from utils.config import (
     guild_macro,
 )
 from utils.pgdatabase import Postgres
+from utils.spotify_fetch import playlist_tracks
 
 YTDLP_SLOW_STARTUP_SECONDS = 10
 FFMPEG_SLOW_STARTUP_SECONDS = 5
@@ -66,6 +69,10 @@ YTDLP_URL_MAX_AGE_SECONDS = 4 * 60 * 60
 # tenta UMA re-resolucao da mesma faixa antes de pular para a proxima.
 PLAYBACK_START_THRESHOLD_SECONDS = 8
 PLAYBACK_MAX_RETRIES = 1
+# Depois de uma tentativa que demorou (timeout/rede lenta), espera um pouco
+# antes de tentar a proxima faixa: evita rajada de yt-dlp numa maquina fraca.
+RESOLVE_FAILURE_MIN_SECONDS = 3.0
+RESOLVE_FAILURE_PAUSE_SECONDS = 2.0
 
 # Define YTDLP_DEBUG=1 no ambiente para incluir tambem as linhas [debug]
 # do yt-dlp no log (o --verbose ja e sempre usado para manter o stdout limpo)
@@ -86,8 +93,43 @@ DROPBOX_FILE = os.path.abspath(
 log = logging.getLogger("music")
 
 
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    """Le um inteiro do ambiente, com fallback seguro para valor invalido."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        log.warning("Valor invalido para %s=%r; usando %s", name, raw, default)
+        return default
+
+
+# A maquina alvo e pequena (compartilhada, ~512MB). Cada extracao sobe um
+# processo Python do yt-dlp e, em desafios JS do YouTube, um deno. Rodar mais
+# de uma ao mesmo tempo estoura a RAM e trava a maquina inteira, entao o padrao
+# e 1 (fila global de extracoes). Ajuste com YTDLP_MAX_CONCURRENT.
+YTDLP_MAX_CONCURRENT = _env_int("YTDLP_MAX_CONCURRENT", 1, minimum=1)
+# Salvaguarda extra: se a memoria disponivel do sistema cair abaixo disso
+# durante uma extracao, o yt-dlp e morto em vez de empurrar a maquina para o
+# swap. 0 desativa. Sem /proc (ex. Windows) a checagem e ignorada.
+YTDLP_MIN_AVAILABLE_MB = _env_int("YTDLP_MIN_AVAILABLE_MB", 64)
+
+# Uma extracao por vez no maximo; o prefetch usa try-acquire para nunca
+# segurar o unico slot enquanto outra guild quer comecar a tocar.
+_extract_slots = asyncio.Semaphore(YTDLP_MAX_CONCURRENT)
+
+
 class ResolutionAborted(Exception):
     """Levantada quando skip/stop cancela uma resolucao yt-dlp em andamento."""
+
+
+class ResolutionDeferred(Exception):
+    """Nao havia slot global de extracao livre (usado pelo prefetch).
+
+    Em vez de esperar (e atrasar a reprodução de outra guild), a resolucao
+    antecipada simplesmente desiste; a faixa e resolvida na hora de tocar.
+    """
 
 
 class BotCheckError(RuntimeError):
@@ -258,6 +300,9 @@ def _is_track_fresh(track: Track) -> bool:
 
 _cookie_cache = {"mtime": None, "value": ""}
 _mashups_cache: list[str] = []
+# Titulos de mashups ja descobertos (link -> titulo), para o comando nao
+# re-extrair ate 100 links com o yt-dlp a cada uso.
+_mashup_titles: dict[str, str] = {}
 
 
 def _extract_cookie_header(path: str) -> str:
@@ -422,12 +467,99 @@ def _build_ffmpeg_headers(data: dict) -> dict:
     return headers
 
 
+_MEMINFO_AVAILABLE = re.compile(r"^MemAvailable:\s+(\d+)\s+kB", re.MULTILINE)
+
+
+def _available_memory_mb() -> float | None:
+    """Memoria disponivel do sistema em MB (None quando nao da para saber)."""
+    try:
+        with open("/proc/meminfo", "r", encoding="ascii", errors="ignore") as handle:
+            head = handle.read(4096)
+    except OSError:
+        return None
+    match = _MEMINFO_AVAILABLE.search(head)
+    if match is None:
+        return None
+    return int(match.group(1)) / 1024.0
+
+
+def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
+    """Mata o yt-dlp E os filhos (deno), nao so o processo principal.
+
+    O subprocesso e criado em uma sessao propria (start_new_session), entao
+    ``killpg`` alcanca o deno que o yt-dlp lanca. Matar apenas o PID pai
+    deixava denos orfaos consumindo CPU/RAM ate a maquina travar.
+    """
+    if os.name == "posix" and hasattr(os, "killpg"):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError):
+            pass
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+
+
+async def _acquire_extract_slot(
+    abort_event: asyncio.Event | None, wait: bool
+) -> None:
+    """Reserva o slot global de extracao; levanta se desistir.
+
+    Com ``wait=False`` (prefetch) e levantado :class:`ResolutionDeferred`
+    quando o slot esta ocupado, para a resolucao antecipada nunca atrasar a
+    reproducao de outra guild. Com ``wait=True`` espera em fatias curtas para
+    ainda respeitar skip/stop de imediato.
+    """
+    if not _extract_slots.locked():
+        await _extract_slots.acquire()
+        return
+
+    if not wait:
+        raise ResolutionDeferred("slot de extracao ocupado")
+
+    log.info(
+        "Aguardando slot de extracao yt-dlp (%s em uso)", YTDLP_MAX_CONCURRENT
+    )
+    while True:
+        if abort_event is not None and abort_event.is_set():
+            raise ResolutionAborted("slot")
+        try:
+            await asyncio.wait_for(_extract_slots.acquire(), timeout=0.5)
+            return
+        except TimeoutError:
+            continue
+
+
 async def _extract_info_isolated(
     url: str,
     idle_timeout: float = YTDLP_IDLE_TIMEOUT_SECONDS,
     max_timeout: float | None = YTDLP_MAX_TIMEOUT_SECONDS,
     abort_event: asyncio.Event | None = None,
     use_cookies: bool = True,
+    wait_for_slot: bool = True,
+) -> dict:
+    """Extrai metadados ocupando um slot global de extracao.
+
+    O numero de yt-dlp simultaneos fica limitado a ``YTDLP_MAX_CONCURRENT``
+    (padrao 1) porque cada processo custa RAM demais para uma maquina pequena.
+    """
+    await _acquire_extract_slot(abort_event, wait_for_slot)
+    try:
+        return await _run_ytdlp_extraction(
+            url, idle_timeout, max_timeout, abort_event, use_cookies
+        )
+    finally:
+        _extract_slots.release()
+
+
+async def _run_ytdlp_extraction(
+    url: str,
+    idle_timeout: float,
+    max_timeout: float | None,
+    abort_event: asyncio.Event | None,
+    use_cookies: bool,
 ) -> dict:
     """Extrai metadados em um subprocesso que pode ser morto sem travar o bot.
 
@@ -483,15 +615,29 @@ async def _extract_info_isolated(
     if sys.platform != "win32" and shutil.which("nice"):
         command = ["nice", "-n", str(YTDLP_NICE_LEVEL), *command]
 
+    if YTDLP_MIN_AVAILABLE_MB > 0:
+        available = _available_memory_mb()
+        if available is not None and available < YTDLP_MIN_AVAILABLE_MB:
+            log.warning(
+                "Memoria disponivel baixa (%.0fMB) antes de resolver %s; "
+                "a extracao sera abortada se piorar",
+                available,
+                url,
+            )
+
     process = await asyncio.create_subprocess_exec(
         *command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=1024 * 1024,
+        # Sessao propria: permite matar o yt-dlp e o deno que ele lanca juntos.
+        start_new_session=os.name == "posix",
     )
 
     stdout_chunks: list[bytes] = []
-    stderr_lines: list[str] = []
+    # Bounded: o --verbose pode imprimir centenas de linhas por extracao e a
+    # lista crescia sem limite (memoria valiosa numa maquina de 512MB).
+    stderr_lines: deque[str] = deque(maxlen=200)
     last_activity = time.monotonic()
 
     async def _drain_stdout(stream):
@@ -531,7 +677,7 @@ async def _extract_info_isolated(
     wait_task = asyncio.create_task(process.wait())
 
     def _stderr_tail(limit: int = 50) -> str:
-        return "\n".join(stderr_lines[-limit:]) or "(sem saida do yt-dlp)"
+        return "\n".join(list(stderr_lines)[-limit:]) or "(sem saida do yt-dlp)"
 
     timeout_reason: str | None = None
     aborted = False
@@ -548,6 +694,15 @@ async def _extract_info_isolated(
                 timeout_reason = f"sem saida por {idle_timeout:.0f}s"
                 break
 
+            if YTDLP_MIN_AVAILABLE_MB > 0:
+                available = _available_memory_mb()
+                if available is not None and available < YTDLP_MIN_AVAILABLE_MB:
+                    # A maquina esta a beira do swap: nao adianta esperar.
+                    timeout_reason = (
+                        f"memoria disponivel baixa ({available:.0f}MB)"
+                    )
+                    break
+
             wait_budget = min(idle_left, YTDLP_POLL_INTERVAL_SECONDS)
             if max_timeout is not None:
                 max_left = max_timeout - (now - started)
@@ -563,21 +718,23 @@ async def _extract_info_isolated(
                 # Sem saida dentro da janela: reavalia progresso/abort.
                 continue
     except asyncio.CancelledError:
-        process.kill()
-        wait_task.cancel()
-        stdout_task.cancel()
-        stderr_task.cancel()
+        _kill_process_tree(process)
+        for task in (stdout_task, stderr_task, wait_task):
+            task.cancel()
+        await asyncio.gather(
+            stdout_task, stderr_task, wait_task, return_exceptions=True
+        )
         raise
 
     if aborted:
-        process.kill()
+        _kill_process_tree(process)
         await wait_task
         await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
         log.info("yt-dlp abortado para %s. Ultimas linhas:\n%s", url, _stderr_tail(10))
         raise ResolutionAborted(url)
 
     if timeout_reason is not None:
-        process.kill()
+        _kill_process_tree(process)
         await wait_task
         await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
         log.error(
@@ -689,6 +846,7 @@ class Music(commands.Cog):
         idle_timeout: float = YTDLP_IDLE_TIMEOUT_SECONDS,
         max_timeout: float | None = YTDLP_MAX_TIMEOUT_SECONDS,
         abort_event: asyncio.Event | None = None,
+        wait_for_slot: bool = True,
     ) -> Track | None:
         """Resolve uma Track via yt-dlp. Retorna None em caso de falha.
 
@@ -696,6 +854,9 @@ class Music(commands.Cog):
         tenta de novo sem login (clientes sem cookie, ex. visionos) e marca os
         cookies como ruins. Levanta :class:`BotCheckError` quando nem o fallback
         sem cookie consegue extrair.
+
+        ``wait_for_slot=False`` (prefetch) desiste quando o slot global de
+        extracao esta ocupado, em vez de esperar e atrasar outra guild.
         """
         if _is_track_fresh(track):
             return track
@@ -707,10 +868,18 @@ class Music(commands.Cog):
         started_at = time.monotonic()
         try:
             data = await self._extract_with_cookie_fallback(
-                track, idle_timeout, max_timeout, abort_event, use_cookies
+                track,
+                idle_timeout,
+                max_timeout,
+                abort_event,
+                use_cookies,
+                wait_for_slot,
             )
         except ResolutionAborted:
             raise
+        except ResolutionDeferred:
+            log.debug("Prefetch adiado (slot ocupado) para '%s'", track.query)
+            return None
         except BotCheckError:
             raise
         except Exception as e:  # pylint: disable=broad-exception-caught
@@ -743,6 +912,7 @@ class Music(commands.Cog):
         max_timeout: float | None,
         abort_event: asyncio.Event | None,
         use_cookies: bool,
+        wait_for_slot: bool = True,
     ) -> dict:
         """Extrai a faixa; se o login for recusado, tenta anonimo (sem cookies).
 
@@ -759,6 +929,7 @@ class Music(commands.Cog):
                 max_timeout,
                 abort_event,
                 use_cookies=use_cookies,
+                wait_for_slot=wait_for_slot,
             )
         except BotCheckError:
             if not use_cookies:
@@ -777,6 +948,7 @@ class Music(commands.Cog):
                 max_timeout,
                 abort_event,
                 use_cookies=False,
+                wait_for_slot=wait_for_slot,
             )
 
     def _build_source(self, track: Track, state: GuildPlayer, extra_before: str = ""):
@@ -984,14 +1156,18 @@ class Music(commands.Cog):
         state.prefetch_task = asyncio.create_task(self._prefetch_next(guild_id, state))
 
     async def _prefetch_next(self, guild_id: int, state: GuildPlayer):
-        """Resolve a proxima faixa da fila (mutando o proprio objeto da fila)."""
+        """Resolve a proxima faixa da fila (mutando o proprio objeto da fila).
+
+        Usa o slot global de extracao apenas se estiver livre: prefetch nunca
+        deve segurar o unico slot enquanto outra guild espera para tocar.
+        """
         if not state.queue:
             return
         track = state.queue[0]
         if _is_track_fresh(track):
             return
         try:
-            resolved = await self._resolve_track(track)
+            resolved = await self._resolve_track(track, wait_for_slot=False)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # pylint: disable=broad-exception-caught
@@ -1041,6 +1217,7 @@ class Music(commands.Cog):
             attempts += 1
             track = state.queue.pop(0)
             state.resolving = True
+            attempt_started = time.monotonic()
             try:
                 resolved = await self._resolve_for_playback(state, track)
             except ResolutionAborted:
@@ -1053,10 +1230,12 @@ class Music(commands.Cog):
                     track.query,
                 )
                 await self._edit_now_playing_cookies_warning(state)
+                await self._pause_after_failed_attempt(attempt_started)
                 continue
             finally:
                 state.resolving = False
             if resolved is None:
+                await self._pause_after_failed_attempt(attempt_started)
                 continue
 
             try:
@@ -1094,6 +1273,16 @@ class Music(commands.Cog):
             )
             return
         await self._disconnect_nolock(guild_id, state)
+
+    async def _pause_after_failed_attempt(self, attempt_started: float) -> None:
+        """Espera antes da proxima faixa quando a tentativa anterior demorou.
+
+        Falhas instantaneas (video removido, URL invalida) continuam sendo
+        puladas na hora; apenas tentativas lentas/timeouts ganham um respiro
+        para nao virar uma rajada de processos yt-dlp.
+        """
+        if time.monotonic() - attempt_started >= RESOLVE_FAILURE_MIN_SECONDS:
+            await asyncio.sleep(RESOLVE_FAILURE_PAUSE_SECONDS)
 
     def _make_after(self, guild_id: int, generation: int):
         def after(error):
@@ -1596,7 +1785,9 @@ class Music(commands.Cog):
             log.info("Iniciando busca por mashups")
 
             try:
-                mashups = _load_mashups()
+                # Parsear 1.3MB de HTML com BeautifulSoup trava o event loop
+                # inteiro (e todas as guilds) por instantes: vai para a thread.
+                mashups = await asyncio.to_thread(_load_mashups)
             except OSError as e:
                 log.error("Erro ao ler Dropbox.html: %s", e)
                 return await ctx.send("```Lista de mashups indisponível```")
@@ -1617,12 +1808,16 @@ class Music(commands.Cog):
                 found = False
                 tracks = []
                 for link in mashups[:MASHUP_SCAN_LIMIT]:
-                    try:
-                        info = await _extract_info_isolated(link)
-                    except Exception as exc:  # pylint: disable=broad-exception-caught
-                        log.warning("Erro ao buscar mashup '%s': %s", link, exc)
-                        continue
-                    nome = info.get("title") if info else None
+                    nome = _mashup_titles.get(link)
+                    if not nome:
+                        try:
+                            info = await _extract_info_isolated(link)
+                        except Exception as exc:  # pylint: disable=broad-exception-caught
+                            log.warning("Erro ao buscar mashup '%s': %s", link, exc)
+                            continue
+                        nome = (info or {}).get("title") or ""
+                        if nome:
+                            _mashup_titles[link] = nome
                     if nome and nome.startswith(num):
                         log.info("Encontrou: %s", nome)
                         tracks = [Track(link)]
