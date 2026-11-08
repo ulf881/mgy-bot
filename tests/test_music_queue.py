@@ -459,11 +459,13 @@ def _fake_extract_data():
     }
 
 
-def test_resolve_track_uses_cookies_when_available(monkeypatch):
+def test_resolve_track_prefers_anonymous_when_it_works(monkeypatch):
+    """Com cookies disponiveis ainda tentamos anonimo primeiro (sem deno)."""
     cog = make_cog(monkeypatch)
     track = music.Track("song")
     monkeypatch.setattr(music, "_has_login_cookies", lambda: True)
     monkeypatch.setattr(music, "_cookies_rejected_for_current_file", lambda: False)
+    monkeypatch.setattr(music, "_anon_mode", None)
 
     calls = []
 
@@ -475,7 +477,83 @@ def test_resolve_track_uses_cookies_when_available(monkeypatch):
 
     asyncio.run(cog._resolve_track(track))
 
-    assert calls == [True]
+    assert calls == [False]
+    assert music._anon_mode is True
+
+
+def test_resolve_track_uses_cookies_after_anonymous_bot_check(monkeypatch):
+    """Se o anonimo levar bot check, cai para cookies e memoriza o modo."""
+    cog = make_cog(monkeypatch)
+    monkeypatch.setattr(music, "_has_login_cookies", lambda: True)
+    monkeypatch.setattr(music, "_cookies_rejected_for_current_file", lambda: False)
+    monkeypatch.setattr(music, "_anon_mode", None)
+
+    calls = []
+
+    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True, wait_for_slot=True):
+        calls.append(use_cookies)
+        if not use_cookies:
+            raise music.BotCheckError("sign in to confirm")
+        return _fake_extract_data()
+
+    monkeypatch.setattr(music, "_extract_info_isolated", fake_extract)
+
+    asyncio.run(cog._resolve_track(music.Track("a")))
+
+    assert calls == [False, True]
+    assert music._anon_mode is False
+
+    # Proxima faixa vai direto para cookies, sem gastar a tentativa anonima.
+    asyncio.run(cog._resolve_track(music.Track("b")))
+
+    assert calls == [False, True, True]
+
+
+def test_resolve_track_age_restricted_keeps_anonymous_mode(monkeypatch):
+    """Video com restricao de idade usa cookies sem desligar o modo anonimo."""
+    cog = make_cog(monkeypatch)
+    monkeypatch.setattr(music, "_has_login_cookies", lambda: True)
+    monkeypatch.setattr(music, "_cookies_rejected_for_current_file", lambda: False)
+    monkeypatch.setattr(music, "_anon_mode", None)
+
+    calls = []
+
+    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True, wait_for_slot=True):
+        calls.append(use_cookies)
+        if not use_cookies:
+            raise music.BotCheckError(
+                "Sign in to confirm your age. This video may be inappropriate for some users."
+            )
+        return _fake_extract_data()
+
+    monkeypatch.setattr(music, "_extract_info_isolated", fake_extract)
+
+    track = music.Track("age")
+    asyncio.run(cog._resolve_track(track))
+
+    assert calls == [False, True]
+    assert track.title == "ok"
+    # Restricao de idade e por video: nao desliga o caminho anonimo rapido.
+    assert music._anon_mode is not False
+
+
+def test_resolve_track_does_not_retry_unavailable_with_cookies(monkeypatch):
+    """Video removido/indisponivel nao ganha uma segunda extracao lenta."""
+    cog = make_cog(monkeypatch)
+    monkeypatch.setattr(music, "_has_login_cookies", lambda: True)
+    monkeypatch.setattr(music, "_cookies_rejected_for_current_file", lambda: False)
+    monkeypatch.setattr(music, "_anon_mode", None)
+
+    calls = []
+
+    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True, wait_for_slot=True):
+        calls.append(use_cookies)
+        raise RuntimeError("Video unavailable")
+
+    monkeypatch.setattr(music, "_extract_info_isolated", fake_extract)
+
+    assert asyncio.run(cog._resolve_track(music.Track("gone"))) is None
+    assert calls == [False]
 
 
 def test_resolve_track_skips_cookies_when_rejected(monkeypatch):
@@ -498,11 +576,13 @@ def test_resolve_track_skips_cookies_when_rejected(monkeypatch):
 
 
 def test_resolve_track_falls_back_without_cookies(monkeypatch):
+    """Cookies recusados -> anonimo, com o modo anonimo ja forcado."""
     cog = make_cog(monkeypatch)
     track = music.Track("song")
     monkeypatch.setattr(music, "_has_login_cookies", lambda: True)
     monkeypatch.setattr(music, "_cookies_rejected_for_current_file", lambda: False)
     monkeypatch.setattr(music, "_mark_cookies_rejected", lambda: True)
+    monkeypatch.setattr(music, "_anon_mode", False)
 
     calls = []
 
@@ -645,15 +725,20 @@ class FakeTypingChannel:
 
 
 def test_resolve_track_marks_rejected_when_fallback_fails(monkeypatch):
+    """Anonimo falha, cookies falham: nao repete o anonimo uma terceira vez."""
     cog = make_cog(monkeypatch)
     track = music.Track("song")
     monkeypatch.setattr(music, "_has_login_cookies", lambda: True)
     monkeypatch.setattr(music, "_cookies_rejected_for_current_file", lambda: False)
+    monkeypatch.setattr(music, "_anon_mode", None)
 
     marked = []
     monkeypatch.setattr(music, "_mark_cookies_rejected", lambda: marked.append(1) or True)
 
+    calls = []
+
     async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True, wait_for_slot=True):
+        calls.append(use_cookies)
         raise music.BotCheckError("sign in to confirm")
 
     monkeypatch.setattr(music, "_extract_info_isolated", fake_extract)
@@ -665,6 +750,7 @@ def test_resolve_track_marks_rejected_when_fallback_fails(monkeypatch):
         raised = True
 
     assert raised
+    assert calls == [False, True]
     assert marked == [1]  # marcou os cookies mesmo com o fallback falhando
 
 

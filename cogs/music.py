@@ -69,10 +69,6 @@ YTDLP_URL_MAX_AGE_SECONDS = 4 * 60 * 60
 # tenta UMA re-resolucao da mesma faixa antes de pular para a proxima.
 PLAYBACK_START_THRESHOLD_SECONDS = 8
 PLAYBACK_MAX_RETRIES = 1
-# Depois de uma tentativa que demorou (timeout/rede lenta), espera um pouco
-# antes de tentar a proxima faixa: evita rajada de yt-dlp numa maquina fraca.
-RESOLVE_FAILURE_MIN_SECONDS = 3.0
-RESOLVE_FAILURE_PAUSE_SECONDS = 2.0
 
 # Define YTDLP_DEBUG=1 no ambiente para incluir tambem as linhas [debug]
 # do yt-dlp no log (o --verbose ja e sempre usado para manter o stdout limpo)
@@ -106,18 +102,30 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
 
 
 # A maquina alvo e pequena (compartilhada, ~512MB). Cada extracao sobe um
-# processo Python do yt-dlp e, em desafios JS do YouTube, um deno. Rodar mais
-# de uma ao mesmo tempo estoura a RAM e trava a maquina inteira, entao o padrao
-# e 1 (fila global de extracoes). Ajuste com YTDLP_MAX_CONCURRENT.
+# processo Python do yt-dlp e, em desafios JS do YouTube, um runtime JS (qjs).
+# Rodar mais de uma ao mesmo tempo estoura a RAM e trava a maquina inteira,
+# entao o padrao e 1 (fila global de extracoes). Ajuste com
+# YTDLP_MAX_CONCURRENT.
 YTDLP_MAX_CONCURRENT = _env_int("YTDLP_MAX_CONCURRENT", 1, minimum=1)
 # Salvaguarda extra: se a memoria disponivel do sistema cair abaixo disso
 # durante uma extracao, o yt-dlp e morto em vez de empurrar a maquina para o
-# swap. 0 desativa. Sem /proc (ex. Windows) a checagem e ignorada.
+# swap. 0 desativa. Sem /proc a checagem e ignorada.
 YTDLP_MIN_AVAILABLE_MB = _env_int("YTDLP_MIN_AVAILABLE_MB", 64)
+# Tenta primeiro a extracao anonima (cliente visionos, sem JS challenge/deno)
+# e so cai para os cookies se o YouTube exigir login. Com cookies o yt-dlp
+# descarta o visionos e resolve em ~100s; anonimo costuma levar poucos
+# segundos. 0 forca sempre o caminho com cookies.
+YTDLP_PREFER_ANONYMOUS = bool(_env_int("YTDLP_PREFER_ANONYMOUS", 1))
 
 # Uma extracao por vez no maximo; o prefetch usa try-acquire para nunca
 # segurar o unico slot enquanto outra guild quer comecar a tocar.
 _extract_slots = asyncio.Semaphore(YTDLP_MAX_CONCURRENT)
+# Setado quando uma reproducao esta esperando o slot: o prefetch em andamento
+# se mata na hora para liberar a vaga (playback sempre tem prioridade).
+_prefetch_abort = asyncio.Event()
+# None = ainda nao sabemos; True = extracao anonima funciona; False = o IP
+# levou bot check anonimo e devemos ir direto para os cookies.
+_anon_mode: bool | None = None
 
 
 class ResolutionAborted(Exception):
@@ -169,11 +177,17 @@ _COOKIE_STALE_WARNING = (
     "`mgy cookies` (anexe um cookies.txt novo)."
 )
 
-YTDLP_JS_RUNTIMES = [
-    runtime.strip()
-    for runtime in os.environ.get("YTDLP_JS_RUNTIMES", "").split(",")
-    if runtime.strip()
-]
+# Runtime JS para os desafios do YouTube. Padrao quickjs (`qjs` no PATH): o
+# deno foi descontinuado pelo yt-dlp, pesa ~100MB por resolucao e era o gargalo
+# nas duas guilds. "auto"/"default" deixa o yt-dlp escolher (deno hoje);
+# vazio tambem usa quickjs. Aceita RUNTIME ou RUNTIME:PATH, separados por
+# virgula (ex.: YTDLP_JS_RUNTIMES=quickjs:C:\qjs\qjs.exe).
+_js_runtimes_env = os.environ.get("YTDLP_JS_RUNTIMES", "").strip() or "quickjs"
+YTDLP_JS_RUNTIMES = (
+    []
+    if _js_runtimes_env.lower() in ("auto", "default")
+    else [runtime.strip() for runtime in _js_runtimes_env.split(",") if runtime.strip()]
+)
 
 ytdl_format_options = {
     "format": "bestaudio[ext=webm]/bestaudio/best",
@@ -415,6 +429,12 @@ def _is_bot_check(text: str) -> bool:
     return "sign in to confirm" in lowered or "login_required" in lowered
 
 
+def _is_age_restricted(text: str) -> bool:
+    """True para o erro de restricao de idade (login com cookies resolve)."""
+    lowered = (text or "").lower()
+    return "confirm your age" in lowered or "inappropriate for some users" in lowered
+
+
 def _has_login_cookies() -> bool:
     """True se o cookies.txt existe e tem cookies de login do YouTube."""
     try:
@@ -522,14 +542,19 @@ async def _acquire_extract_slot(
     log.info(
         "Aguardando slot de extracao yt-dlp (%s em uso)", YTDLP_MAX_CONCURRENT
     )
-    while True:
-        if abort_event is not None and abort_event.is_set():
-            raise ResolutionAborted("slot")
-        try:
-            await asyncio.wait_for(_extract_slots.acquire(), timeout=0.5)
-            return
-        except TimeoutError:
-            continue
+    # Reproducao tem prioridade: mata o prefetch que estiver segurando o slot.
+    _prefetch_abort.set()
+    try:
+        while True:
+            if abort_event is not None and abort_event.is_set():
+                raise ResolutionAborted("slot")
+            try:
+                await asyncio.wait_for(_extract_slots.acquire(), timeout=0.5)
+                return
+            except TimeoutError:
+                continue
+    finally:
+        _prefetch_abort.clear()
 
 
 async def _extract_info_isolated(
@@ -609,7 +634,7 @@ async def _run_ytdlp_extraction(
             command.extend(["--js-runtimes", runtime])
     command.append(url)
 
-    # O yt-dlp (e o deno que ele spawna para resolver JS challenges do
+    # O yt-dlp (e o runtime JS que ele spawna para resolver os challenges do
     # YouTube) roda em prioridade menor que o ffmpeg, para nao roubar CPU
     # do audio durante a resolucao do prefetch.
     if sys.platform != "win32" and shutil.which("nice"):
@@ -730,6 +755,10 @@ async def _run_ytdlp_extraction(
         _kill_process_tree(process)
         await wait_task
         await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        if _prefetch_abort.is_set():
+            # Playback precisa do slot: prefetch sai de cena sem barulho.
+            log.info("Prefetch de %s interrompido para liberar o slot", url)
+            raise ResolutionDeferred(url)
         log.info("yt-dlp abortado para %s. Ultimas linhas:\n%s", url, _stderr_tail(10))
         raise ResolutionAborted(url)
 
@@ -914,14 +943,49 @@ class Music(commands.Cog):
         use_cookies: bool,
         wait_for_slot: bool = True,
     ) -> dict:
-        """Extrai a faixa; se o login for recusado, tenta anonimo (sem cookies).
+        """Extrai a faixa preferindo o modo que estiver funcionando.
 
-        Sem login o yt-dlp passa a usar clientes sem cookie (ex. visionos), o
-        que costuma escapar do bot check. Marcamos os cookies atuais como ruins
-        assim que o login e recusado, para as proximas resolucoes irem direto no
-        modo anonimo (mais rapido) e para o embed avisar a Staff, ate o arquivo
-        ser trocado (comando ``mgy cookies``).
+        Com cookies o yt-dlp descarta o cliente visionos e cai em clientes que
+        exigem resolver JS challenge (deno/qjs): a resolucao passava de ~100s
+        no log real. Sem cookies o visionos e usado (sem JS player) e costuma
+        resolver em poucos segundos. Por isso tentamos anonimo primeiro e so
+        usamos cookies quando o YouTube exige login. Se os cookies forem
+        recusados (bot check), voltamos para o modo anonimo e avisamos a Staff
+        (comando ``mgy cookies``).
         """
+        global _anon_mode
+
+        tried_anon = False
+        if use_cookies and YTDLP_PREFER_ANONYMOUS and _anon_mode is not False:
+            tried_anon = True
+            try:
+                data = await _extract_info_isolated(
+                    track.query,
+                    idle_timeout,
+                    max_timeout,
+                    abort_event,
+                    use_cookies=False,
+                    wait_for_slot=wait_for_slot,
+                )
+            except BotCheckError as exc:
+                # Bot check ou video que exige login (idade): repete com cookies.
+                # So desliga o modo anonimo quando o IP foi sinalizado; a
+                # restricao de idade e por video.
+                if not _is_age_restricted(str(exc)):
+                    _anon_mode = False
+                log.warning(
+                    "Extracao anonima recusada para '%s'; tentando com cookies",
+                    track.query,
+                )
+            else:
+                if _anon_mode is not True:
+                    _anon_mode = True
+                    log.info(
+                        "Extracao anonima funcionando (sem cookies, sem JS "
+                        "challenge): resolucao mais rapida"
+                    )
+                return data
+
         try:
             return await _extract_info_isolated(
                 track.query,
@@ -934,14 +998,18 @@ class Music(commands.Cog):
         except BotCheckError:
             if not use_cookies:
                 raise
+            if _mark_cookies_rejected():
+                log.warning(
+                    "Cookies do YouTube recusados; extraindo sem cookies ate o "
+                    "cookies.txt ser atualizado (mgy cookies)"
+                )
+            if tried_anon:
+                # Ja gastamos a tentativa anonima nesta faixa: nao repetir.
+                raise
             log.warning(
                 "Cookies do YouTube recusados (bot check) para '%s'; tentando sem login",
                 track.query,
             )
-            if _mark_cookies_rejected():
-                log.warning(
-                    "Extraindo sem cookies ate o cookies.txt ser atualizado (mgy cookies)"
-                )
             return await _extract_info_isolated(
                 track.query,
                 idle_timeout,
@@ -1167,7 +1235,9 @@ class Music(commands.Cog):
         if _is_track_fresh(track):
             return
         try:
-            resolved = await self._resolve_track(track, wait_for_slot=False)
+            resolved = await self._resolve_track(
+                track, abort_event=_prefetch_abort, wait_for_slot=False
+            )
         except asyncio.CancelledError:
             raise
         except Exception as e:  # pylint: disable=broad-exception-caught
@@ -1217,7 +1287,6 @@ class Music(commands.Cog):
             attempts += 1
             track = state.queue.pop(0)
             state.resolving = True
-            attempt_started = time.monotonic()
             try:
                 resolved = await self._resolve_for_playback(state, track)
             except ResolutionAborted:
@@ -1230,12 +1299,10 @@ class Music(commands.Cog):
                     track.query,
                 )
                 await self._edit_now_playing_cookies_warning(state)
-                await self._pause_after_failed_attempt(attempt_started)
                 continue
             finally:
                 state.resolving = False
             if resolved is None:
-                await self._pause_after_failed_attempt(attempt_started)
                 continue
 
             try:
@@ -1273,16 +1340,6 @@ class Music(commands.Cog):
             )
             return
         await self._disconnect_nolock(guild_id, state)
-
-    async def _pause_after_failed_attempt(self, attempt_started: float) -> None:
-        """Espera antes da proxima faixa quando a tentativa anterior demorou.
-
-        Falhas instantaneas (video removido, URL invalida) continuam sendo
-        puladas na hora; apenas tentativas lentas/timeouts ganham um respiro
-        para nao virar uma rajada de processos yt-dlp.
-        """
-        if time.monotonic() - attempt_started >= RESOLVE_FAILURE_MIN_SECONDS:
-            await asyncio.sleep(RESOLVE_FAILURE_PAUSE_SECONDS)
 
     def _make_after(self, guild_id: int, generation: int):
         def after(error):
