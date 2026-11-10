@@ -305,18 +305,63 @@ def test_advance_locked_stops_when_budget_is_exhausted(monkeypatch):
     monkeypatch.setattr(music, "RESOLVE_TOTAL_BUDGET_SECONDS", 0)
 
     calls = []
+    scheduled = []
 
     async def fake_resolve(track, **kwargs):
         calls.append(track.query)
         return None
 
     cog._resolve_track = fake_resolve
+    monkeypatch.setattr(
+        cog, "_schedule_advance_retry", lambda gid, st: scheduled.append(gid)
+    )
 
     asyncio.run(cog._advance_locked(1, state))
 
     assert calls == []  # nem tentou: o orcamento ja estava estourado
     assert [t.query for t in state.queue] == ["a", "b"]  # fila preservada
     assert state.voice.played is None
+    assert scheduled == [1]  # a guild vai tentar de novo sozinha
+
+
+def test_retry_advance_resumes_stalled_queue(monkeypatch):
+    """A retomada agendada volta a tocar em vez de deixar a guild muda."""
+    cog = make_cog(monkeypatch)
+    state = cog._state(1)
+    state.voice = FakeVoice()
+    state.queue = [music.Track("next")]
+
+    advanced = []
+
+    async def fake_advance(guild_id, st):
+        # O campo precisa estar livre para uma nova falha agendar outra tentativa.
+        assert st.retry_task is None
+        advanced.append(guild_id)
+
+    cog._advance_locked = fake_advance
+
+    asyncio.run(cog._retry_advance(1, state, 0))
+
+    assert advanced == [1]
+
+
+def test_retry_advance_does_nothing_when_already_playing(monkeypatch):
+    cog = make_cog(monkeypatch)
+    state = cog._state(1)
+    state.voice = FakeVoice()
+    state.current = music.Track("playing")
+    state.queue = [music.Track("next")]
+
+    advanced = []
+
+    async def fake_advance(guild_id, st):
+        advanced.append(guild_id)
+
+    cog._advance_locked = fake_advance
+
+    asyncio.run(cog._retry_advance(1, state, 0))
+
+    assert advanced == []
 
 
 def test_on_track_end_ignores_stale_generation(monkeypatch):

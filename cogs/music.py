@@ -60,6 +60,11 @@ MAX_RESOLVE_ATTEMPTS = 10
 # esperar o slot global). Sem isso, MAX_RESOLVE_ATTEMPTS x timeout por faixa
 # (~90s) deixava a guild "digitando" por ~15 min segurando o unico slot.
 RESOLVE_TOTAL_BUDGET_SECONDS = 120
+# Se a resolucao estourar o orcamento, a guild tenta de novo sozinha depois
+# deste tempo (dobra a cada falha, ate o maximo), em vez de ficar muda ate
+# alguem mandar `mgy tocar`.
+RESOLVE_RETRY_BASE_SECONDS = 20
+RESOLVE_RETRY_MAX_SECONDS = 300
 MASHUP_SCAN_LIMIT = 100
 # Validade das stream URLs: lemos o vencimento exato do campo "expire" que o
 # proprio googlevideo embute na URL. A idade maxima so e usada como fallback
@@ -272,6 +277,9 @@ class GuildPlayer:
     reconnect_task: asyncio.Task | None = None
     # Identifica o player atual; callbacks "after" antigos sao descartados.
     play_generation: int = 0
+    # Retomada automatica depois de uma resolucao que estourou o tempo.
+    retry_task: asyncio.Task | None = None
+    retry_attempts: int = 0
 
 
 def _url_expires_at(url: str) -> float | None:
@@ -1006,6 +1014,11 @@ class Music(commands.Cog):
     async def _disconnect_nolock(self, guild_id: int, state: GuildPlayer):
         """Desconecta e limpa o estado. Deve ser chamado com o lock adquirido."""
         self._cancel_prefetch(state)
+        retry = state.retry_task
+        state.retry_task = None
+        state.retry_attempts = 0
+        if retry is not None and not retry.done():
+            retry.cancel()
         state.current = None
         state.queue.clear()
         state.now_playing = None
@@ -1114,6 +1127,39 @@ class Music(commands.Cog):
         if task is not None and not task.done():
             task.cancel()
 
+    def _schedule_advance_retry(self, guild_id: int, state: GuildPlayer):
+        """Agenda uma nova tentativa depois de a resolucao estourar o tempo."""
+        if state.retry_task is not None and not state.retry_task.done():
+            return
+        delay = min(
+            RESOLVE_RETRY_BASE_SECONDS * (2**state.retry_attempts),
+            RESOLVE_RETRY_MAX_SECONDS,
+        )
+        state.retry_attempts += 1
+        log.info(
+            "Fila da guild %s parada; tentando de novo em %.0fs (tentativa %d)",
+            guild_id,
+            delay,
+            state.retry_attempts,
+        )
+        state.retry_task = asyncio.create_task(
+            self._retry_advance(guild_id, state, delay)
+        )
+
+    async def _retry_advance(self, guild_id: int, state: GuildPlayer, delay: float):
+        await asyncio.sleep(delay)
+        async with state.lock:
+            # Esta task e a retomada atual: libera o campo para que uma nova
+            # falha consiga agendar a proxima tentativa.
+            state.retry_task = None
+            if state.current is not None or state.voice is None or not state.queue:
+                return
+            log.info("Retomando a fila da guild %s", guild_id)
+            try:
+                await self._advance_locked(guild_id, state)
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                log.error("Erro ao retomar a fila da guild %s: %s", guild_id, e)
+
     def _abort_resolution(self, state: GuildPlayer) -> bool:
         """Pede para a resolucao yt-dlp em andamento parar, sem esperar o lock.
 
@@ -1204,6 +1250,7 @@ class Music(commands.Cog):
                     len(state.queue),
                     guild_id,
                 )
+                self._schedule_advance_retry(guild_id, state)
                 return
             attempts += 1
             track = state.queue.pop(0)
@@ -1247,6 +1294,7 @@ class Music(commands.Cog):
 
             self._apply_volume(state)
             log.info("Tocando %s", resolved.title)
+            state.retry_attempts = 0
             if resolved.title == BONUS_ROOM_TITLE:
                 asyncio.create_task(self._enable_double_xp())
             await self._announce_locked(guild_id, state, resolved)
@@ -1259,6 +1307,7 @@ class Music(commands.Cog):
                 MAX_RESOLVE_ATTEMPTS,
                 len(state.queue),
             )
+            self._schedule_advance_retry(guild_id, state)
             return
         await self._disconnect_nolock(guild_id, state)
 
