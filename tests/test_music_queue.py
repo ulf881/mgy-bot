@@ -296,6 +296,29 @@ def test_advance_locked_stops_on_resolution_aborted(monkeypatch):
     assert state.resolving is False
 
 
+def test_advance_locked_stops_when_budget_is_exhausted(monkeypatch):
+    """Sem orcamento, varias falhas lentas prendiam a guild e o slot por minutos."""
+    cog = make_cog(monkeypatch)
+    state = cog._state(1)
+    state.voice = FakeVoice()
+    state.queue = [music.Track("a"), music.Track("b")]
+    monkeypatch.setattr(music, "RESOLVE_TOTAL_BUDGET_SECONDS", 0)
+
+    calls = []
+
+    async def fake_resolve(track, **kwargs):
+        calls.append(track.query)
+        return None
+
+    cog._resolve_track = fake_resolve
+
+    asyncio.run(cog._advance_locked(1, state))
+
+    assert calls == []  # nem tentou: o orcamento ja estava estourado
+    assert [t.query for t in state.queue] == ["a", "b"]  # fila preservada
+    assert state.voice.played is None
+
+
 def test_on_track_end_ignores_stale_generation(monkeypatch):
     cog = make_cog(monkeypatch)
     state = cog._state(1)
@@ -463,7 +486,6 @@ def test_resolve_track_uses_cookies_when_available(monkeypatch):
     cog = make_cog(monkeypatch)
     track = music.Track("song")
     monkeypatch.setattr(music, "_has_login_cookies", lambda: True)
-    monkeypatch.setattr(music, "_cookies_rejected_for_current_file", lambda: False)
 
     calls = []
 
@@ -478,46 +500,32 @@ def test_resolve_track_uses_cookies_when_available(monkeypatch):
     assert calls == [True]
 
 
-def test_resolve_track_skips_cookies_when_rejected(monkeypatch):
+def test_resolve_track_marks_cookies_rejected_on_bot_check(monkeypatch):
+    """Bot check com cookies: marca para o embed avisar a Staff, sem retry."""
     cog = make_cog(monkeypatch)
     track = music.Track("song")
     monkeypatch.setattr(music, "_has_login_cookies", lambda: True)
-    monkeypatch.setattr(music, "_cookies_rejected_for_current_file", lambda: True)
+
+    marked = []
+    monkeypatch.setattr(music, "_mark_cookies_rejected", lambda: marked.append(1) or True)
 
     calls = []
 
     async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True, wait_for_slot=True):
         calls.append(use_cookies)
-        return _fake_extract_data()
+        raise music.BotCheckError("sign in to confirm")
 
     monkeypatch.setattr(music, "_extract_info_isolated", fake_extract)
 
-    asyncio.run(cog._resolve_track(track))
+    try:
+        asyncio.run(cog._resolve_track(track))
+    except music.BotCheckError:
+        pass
+    else:
+        raise AssertionError("BotCheckError deveria propagar")
 
-    assert calls == [False]
-
-
-def test_resolve_track_falls_back_without_cookies(monkeypatch):
-    cog = make_cog(monkeypatch)
-    track = music.Track("song")
-    monkeypatch.setattr(music, "_has_login_cookies", lambda: True)
-    monkeypatch.setattr(music, "_cookies_rejected_for_current_file", lambda: False)
-    monkeypatch.setattr(music, "_mark_cookies_rejected", lambda: True)
-
-    calls = []
-
-    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True, wait_for_slot=True):
-        calls.append(use_cookies)
-        if use_cookies:
-            raise music.BotCheckError("sign in to confirm")
-        return _fake_extract_data()
-
-    monkeypatch.setattr(music, "_extract_info_isolated", fake_extract)
-
-    asyncio.run(cog._resolve_track(track))
-
-    assert calls == [True, False]
-    assert track.title == "ok"
+    assert calls == [True]  # uma unica extracao, sem fallback sem cookies
+    assert marked == [1]
 
 
 def test_resolve_track_reraises_bot_check_without_cookies(monkeypatch):
@@ -642,36 +650,6 @@ class FakeTypingChannel:
                 outer.exited += 1
 
         return _CM()
-
-
-def test_resolve_track_marks_rejected_when_fallback_fails(monkeypatch):
-    """Anonimo falha, cookies falham: nao repete o anonimo uma terceira vez."""
-    cog = make_cog(monkeypatch)
-    track = music.Track("song")
-    monkeypatch.setattr(music, "_has_login_cookies", lambda: True)
-    monkeypatch.setattr(music, "_cookies_rejected_for_current_file", lambda: False)
-    monkeypatch.setattr(music, "_anon_mode", None)
-
-    marked = []
-    monkeypatch.setattr(music, "_mark_cookies_rejected", lambda: marked.append(1) or True)
-
-    calls = []
-
-    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True, wait_for_slot=True):
-        calls.append(use_cookies)
-        raise music.BotCheckError("sign in to confirm")
-
-    monkeypatch.setattr(music, "_extract_info_isolated", fake_extract)
-
-    raised = False
-    try:
-        asyncio.run(cog._resolve_track(track))
-    except music.BotCheckError:
-        raised = True
-
-    assert raised
-    assert calls == [False, True]
-    assert marked == [1]  # marcou os cookies mesmo com o fallback falhando
 
 
 def test_edit_now_playing_cookies_warning(monkeypatch):

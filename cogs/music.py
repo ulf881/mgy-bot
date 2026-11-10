@@ -56,13 +56,10 @@ YTDLP_POLL_INTERVAL_SECONDS = 1.0
 VOICE_CONNECT_ATTEMPTS = 3
 VOICE_RECONNECT_DELAY_SECONDS = 2.0
 MAX_RESOLVE_ATTEMPTS = 10
-# Teto de tempo total para resolver as proximas faixas de uma guild. Sem isso,
-# MAX_RESOLVE_ATTEMPTS x timeout por faixa (~90s) deixava a guild "digitando"
-# por ~15 min e segurando o unico slot de extracao das outras guilds.
+# Teto de tempo total para resolver as proximas faixas de uma guild (e para
+# esperar o slot global). Sem isso, MAX_RESOLVE_ATTEMPTS x timeout por faixa
+# (~90s) deixava a guild "digitando" por ~15 min segurando o unico slot.
 RESOLVE_TOTAL_BUDGET_SECONDS = 120
-# Teto de espera pelo slot global. Se outra extracao travar, o playback desiste
-# em vez de esperar para sempre.
-EXTRACT_SLOT_WAIT_SECONDS = 120
 MASHUP_SCAN_LIMIT = 100
 # Validade das stream URLs: lemos o vencimento exato do campo "expire" que o
 # proprio googlevideo embute na URL. A idade maxima so e usada como fallback
@@ -161,11 +158,11 @@ BROWSER_HEADERS = {
 }
 
 # Ordem importa: o yt-dlp tenta os clientes na ordem e usa o primeiro que
-# retorna formatos. visionos e web_embedded nao exigem PO token (o visionos
-# nem JS player), entao ficam na frente; tv_downgraded/web suportam cookies.
-# android/ios saem da lista: hoje exigem PO token e nao suportam cookies
-# (yt-dlp os descarta quando ha login). Isso segue os defaults de 2026.
-YOUTUBE_PLAYER_CLIENTS = ["visionos", "web_embedded", "tv_downgraded", "web"]
+# retorna formatos. web_embedded nao exige PO token, entao fica na frente;
+# tv_downgraded/web suportam cookies. visionos sai da lista: nao suporta
+# cookies (o yt-dlp o descarta com login) e sem login leva bot check.
+# android/ios tambem saem: hoje exigem PO token e nao suportam cookies.
+YOUTUBE_PLAYER_CLIENTS = ["web_embedded", "tv_downgraded", "web"]
 
 # Cookies de login do YouTube expiram/rotacionam com o tempo; o sintoma de
 # cookies ausentes/expirados e o "Sign in to confirm you're not a bot".
@@ -441,8 +438,8 @@ def _has_login_cookies() -> bool:
 
 
 # mtime do cookies.txt no momento em que ele foi rejeitado num bot check.
-# Enquanto o arquivo nao mudar, extraimos sem cookies (clientes sem cookie,
-# tipo o visionos) para nao pagar a tentativa falha em toda musica.
+# Enquanto o arquivo nao mudar, o embed de "tocando agora" avisa a Staff para
+# trocar os cookies (comando ``mgy cookies``).
 _cookies_rejected = {"mtime": None}
 
 
@@ -517,9 +514,7 @@ def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
         pass
 
 
-async def _acquire_extract_slot(
-    abort_event: asyncio.Event | None, wait: bool
-) -> None:
+async def _acquire_extract_slot(abort_event: asyncio.Event | None, wait: bool) -> None:
     """Reserva o slot global de extracao; levanta se desistir.
 
     Com ``wait=False`` (prefetch) e levantado :class:`ResolutionDeferred`
@@ -534,9 +529,7 @@ async def _acquire_extract_slot(
     if not wait:
         raise ResolutionDeferred("slot de extracao ocupado")
 
-    log.info(
-        "Aguardando slot de extracao yt-dlp (%s em uso)", YTDLP_MAX_CONCURRENT
-    )
+    log.info("Aguardando slot de extracao yt-dlp (%s em uso)", YTDLP_MAX_CONCURRENT)
     started = time.monotonic()
     # Reproducao tem prioridade: mata o prefetch que estiver segurando o slot.
     _prefetch_abort.set()
@@ -551,10 +544,10 @@ async def _acquire_extract_slot(
                     log.info("Slot de extracao liberado apos %.0fs", waited)
                 return
             except TimeoutError:
-                if time.monotonic() - started >= EXTRACT_SLOT_WAIT_SECONDS:
+                if time.monotonic() - started >= RESOLVE_TOTAL_BUDGET_SECONDS:
                     log.warning(
                         "Slot de extracao ocupado por %.0fs; desistindo desta faixa",
-                        EXTRACT_SLOT_WAIT_SECONDS,
+                        RESOLVE_TOTAL_BUDGET_SECONDS,
                     )
                     raise TimeoutError("slot de extracao ocupado por muito tempo")
                 continue
@@ -601,9 +594,7 @@ async def _run_ytdlp_extraction(
     Se ``abort_event`` for setado (por skip/stop), o subprocesso e morto e
     :class:`ResolutionAborted` e levantada.
 
-    ``use_cookies=False`` forca uma extracao anonima (sem ``--cookies``): sem
-    login o yt-dlp usa clientes sem cookie (ex. visionos), util como fallback
-    quando os cookies estao ausentes/expirados.
+    ``use_cookies=False`` extrai sem ``--cookies`` (quando nao ha cookies.txt).
 
     --verbose e sempre usado para forcar o yt-dlp a enviar as mensagens para
     o stderr, deixando o stdout apenas com o JSON (sem --quiet o yt-dlp
@@ -642,7 +633,7 @@ async def _run_ytdlp_extraction(
     # O yt-dlp (e o runtime JS que ele spawna para resolver os challenges do
     # YouTube) roda em prioridade menor que o ffmpeg, para nao roubar CPU
     # do audio durante a resolucao do prefetch.
-    if sys.platform != "win32" and shutil.which("nice"):
+    if YTDLP_NICE_LEVEL > 0 and sys.platform != "win32" and shutil.which("nice"):
         command = ["nice", "-n", str(YTDLP_NICE_LEVEL), *command]
 
     if YTDLP_MIN_AVAILABLE_MB > 0:
@@ -728,9 +719,7 @@ async def _run_ytdlp_extraction(
                 available = _available_memory_mb()
                 if available is not None and available < YTDLP_MIN_AVAILABLE_MB:
                     # A maquina esta a beira do swap: nao adianta esperar.
-                    timeout_reason = (
-                        f"memoria disponivel baixa ({available:.0f}MB)"
-                    )
+                    timeout_reason = f"memoria disponivel baixa ({available:.0f}MB)"
                     break
 
             wait_budget = min(idle_left, YTDLP_POLL_INTERVAL_SECONDS)
@@ -760,7 +749,7 @@ async def _run_ytdlp_extraction(
         _kill_process_tree(process)
         await wait_task
         await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
-        if _prefetch_abort.is_set():
+        if abort_event is _prefetch_abort:
             # Playback precisa do slot: prefetch sai de cena sem barulho.
             log.info("Prefetch de %s interrompido para liberar o slot", url)
             raise ResolutionDeferred(url)
@@ -884,10 +873,8 @@ class Music(commands.Cog):
     ) -> Track | None:
         """Resolve uma Track via yt-dlp. Retorna None em caso de falha.
 
-        Usa cookies quando disponiveis. Se o YouTube responder com bot check,
-        tenta de novo sem login (clientes sem cookie, ex. visionos) e marca os
-        cookies como ruins. Levanta :class:`BotCheckError` quando nem o fallback
-        sem cookie consegue extrair.
+        Usa cookies quando disponiveis. Num bot check, marca os cookies como
+        ruins (para o embed avisar a Staff) e levanta :class:`BotCheckError`.
 
         ``wait_for_slot=False`` (prefetch) desiste quando o slot global de
         extracao esta ocupado, em vez de esperar e atrasar outra guild.
@@ -898,16 +885,16 @@ class Music(commands.Cog):
             log.info("Stream URL de '%s' expirou; resolvendo novamente", track.query)
             track.stream_url = None
 
-        use_cookies = _has_login_cookies() and not _cookies_rejected_for_current_file()
+        use_cookies = _has_login_cookies()
         started_at = time.monotonic()
         try:
-            data = await self._extract_with_cookie_fallback(
-                track,
+            data = await _extract_info_isolated(
+                track.query,
                 idle_timeout,
                 max_timeout,
                 abort_event,
-                use_cookies,
-                wait_for_slot,
+                use_cookies=use_cookies,
+                wait_for_slot=wait_for_slot,
             )
         except ResolutionAborted:
             raise
@@ -915,6 +902,8 @@ class Music(commands.Cog):
             log.debug("Prefetch adiado (slot ocupado) para '%s'", track.query)
             return None
         except BotCheckError:
+            if use_cookies:
+                _mark_cookies_rejected()
             raise
         except Exception as e:  # pylint: disable=broad-exception-caught
             log.error("Erro ao adquirir video da URL '%s': %s", track.query, e)
@@ -938,52 +927,6 @@ class Music(commands.Cog):
         if elapsed >= YTDLP_SLOW_STARTUP_SECONDS:
             log.warning("yt-dlp startup levou %.1fs para %s", elapsed, track.query)
         return track
-
-    async def _extract_with_cookie_fallback(
-        self,
-        track: Track,
-        idle_timeout: float,
-        max_timeout: float | None,
-        abort_event: asyncio.Event | None,
-        use_cookies: bool,
-        wait_for_slot: bool = True,
-    ) -> dict:
-        """Extrai a faixa; se o login for recusado, tenta sem cookies.
-
-        Sem login o yt-dlp passa a usar clientes sem cookie (ex. visionos), o
-        que as vezes escapa do bot check. Marcamos os cookies atuais como ruins
-        assim que o login e recusado, para as proximas resolucoes irem direto no
-        modo sem cookies e para o embed avisar a Staff, ate o arquivo ser
-        trocado (comando ``mgy cookies``).
-        """
-        try:
-            return await _extract_info_isolated(
-                track.query,
-                idle_timeout,
-                max_timeout,
-                abort_event,
-                use_cookies=use_cookies,
-                wait_for_slot=wait_for_slot,
-            )
-        except BotCheckError:
-            if not use_cookies:
-                raise
-            log.warning(
-                "Cookies do YouTube recusados (bot check) para '%s'; tentando sem login",
-                track.query,
-            )
-            if _mark_cookies_rejected():
-                log.warning(
-                    "Extraindo sem cookies ate o cookies.txt ser atualizado (mgy cookies)"
-                )
-            return await _extract_info_isolated(
-                track.query,
-                idle_timeout,
-                max_timeout,
-                abort_event,
-                use_cookies=False,
-                wait_for_slot=wait_for_slot,
-            )
 
     def _build_source(self, track: Track, state: GuildPlayer, extra_before: str = ""):
         """Cria o FFmpegPCMAudio para uma Track ja resolvida."""
@@ -1249,7 +1192,19 @@ class Music(commands.Cog):
             return
 
         attempts = 0
+        # Orcamento total: sem isso, varias tentativas lentas (timeout de 90s
+        # cada) deixavam a guild "digitando" por ~15 min segurando o slot.
+        deadline = time.monotonic() + RESOLVE_TOTAL_BUDGET_SECONDS
         while state.queue and attempts < MAX_RESOLVE_ATTEMPTS:
+            if time.monotonic() >= deadline:
+                log.warning(
+                    "Limite de %.0fs para resolver a proxima faixa atingido "
+                    "(%d restantes na fila, guild=%s); mantendo a fila",
+                    RESOLVE_TOTAL_BUDGET_SECONDS,
+                    len(state.queue),
+                    guild_id,
+                )
+                return
             attempts += 1
             track = state.queue.pop(0)
             state.resolving = True
