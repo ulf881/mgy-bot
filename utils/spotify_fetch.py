@@ -40,13 +40,41 @@ SECRET_SOURCES = [
 # Version 18 fallback (SpotAPI's hardcoded secret).  Upstream secrets rotate
 # frequently; if this stops working, refresh from SECRET_SOURCES or capture.
 FALLBACK_SECRETS = {
-    "18": [44, 55, 47, 42, 70, 40, 34, 114, 76, 74, 50, 111, 120, 97, 75, 76, 94, 102, 43, 69, 49, 120, 118, 80, 64, 78],
+    "18": [
+        44,
+        55,
+        47,
+        42,
+        70,
+        40,
+        34,
+        114,
+        76,
+        74,
+        50,
+        111,
+        120,
+        97,
+        75,
+        76,
+        94,
+        102,
+        43,
+        69,
+        49,
+        120,
+        118,
+        80,
+        64,
+        78,
+    ],
 }
 
 
 # --------------------------------------------------------------------------
 # TOTP helpers (no pyotp dependency needed)
 # --------------------------------------------------------------------------
+
 
 def _b32_encode(raw: bytes) -> str:
     return base64.b32encode(raw).decode().rstrip("=")
@@ -56,7 +84,7 @@ def _hotp(b32_secret: str, counter: int) -> str:
     msg = struct.pack(">Q", counter)
     digest = hmac.new(base64.b32decode(b32_secret), msg, hashlib.sha1).digest()
     off = digest[-1] & 0x0F
-    code = (struct.unpack(">I", digest[off:off + 4])[0] & 0x7FFFFFFF) % 1_000_000
+    code = (struct.unpack(">I", digest[off : off + 4])[0] & 0x7FFFFFFF) % 1_000_000
     return f"{code:06d}"
 
 
@@ -89,6 +117,7 @@ def _generate_totp(secret_dict: dict) -> tuple[str, str]:
 # Token acquisition
 # --------------------------------------------------------------------------
 
+
 def _access_token(session) -> dict:
     """Anonymous web-player access token via the TOTP flow."""
     server_time = session.get(
@@ -108,12 +137,14 @@ def _access_token(session) -> dict:
     if int(version) < 10:
         client_time = int(time.time() * 1000)
         build_date = time.strftime("%Y-%m-%d", time.gmtime(server_time))
-        params.update({
-            "sTime": server_time,
-            "cTime": client_time,
-            "buildDate": build_date,
-            "buildVer": f"web-player_{build_date}_{server_time * 1000}_{uuid.uuid4().hex[:8]}",
-        })
+        params.update(
+            {
+                "sTime": server_time,
+                "cTime": client_time,
+                "buildDate": build_date,
+                "buildVer": f"web-player_{build_date}_{server_time * 1000}_{uuid.uuid4().hex[:8]}",
+            }
+        )
 
     headers = {
         "User-Agent": UA,
@@ -151,7 +182,9 @@ def _client_token(session, client_id: str, device_id: str) -> str:
     }
     r = session.post(
         "https://clienttoken.spotify.com/v1/clienttoken",
-        json=payload, headers=headers, impersonate=IMPRESONATE,
+        json=payload,
+        headers=headers,
+        impersonate=IMPRESONATE,
     )
     return r.json()["granted_token"]["token"]
 
@@ -159,9 +192,14 @@ def _client_token(session, client_id: str, device_id: str) -> str:
 def _fetchplaylist_hash(session) -> str:
     """Scrape the current fetchPlaylist persisted-query hash from the live bundle."""
     html = session.get("https://open.spotify.com/").text
-    bundles = list(dict.fromkeys(
-        re.findall(r"https://open\.spotifycdn\.com/cdn/build/web-player/[^\"\\']+\.js", html)
-    ))
+    bundles = list(
+        dict.fromkeys(
+            re.findall(
+                r"https://open\.spotifycdn\.com/cdn/build/web-player/[^\"\\']+\.js",
+                html,
+            )
+        )
+    )
     for url in bundles:
         bundle = session.get(url, impersonate=IMPRESONATE).text
         m = re.search(r'"fetchPlaylist","query","([0-9a-f]{64})"', bundle)
@@ -194,6 +232,7 @@ def _headers(playlist_id: str) -> dict:
 # --------------------------------------------------------------------------
 # Public API
 # --------------------------------------------------------------------------
+
 
 def playlist_tracks(playlist_id: str, limit: int = 100) -> list[str]:
     """Return every track of a public playlist as ["Artist Trackname", ...]."""
@@ -228,16 +267,22 @@ def playlist_tracks(playlist_id: str, limit: int = 100) -> list[str]:
         if r.status_code != 200:
             # Hash might have rotated between scrape and request; retry once.
             if fetch_hash != FALLBACK_FETCHPLAYLIST_HASH:
-                payload["extensions"]["persistedQuery"]["sha256Hash"] = FALLBACK_FETCHPLAYLIST_HASH
+                payload["extensions"]["persistedQuery"][
+                    "sha256Hash"
+                ] = FALLBACK_FETCHPLAYLIST_HASH
                 r = session.post(
-                    PATHFINDER_URL, json=payload, headers=headers,
+                    PATHFINDER_URL,
+                    json=payload,
+                    headers=headers,
                     impersonate=IMPRESONATE,
                 )
         if r.status_code != 200:
             raise RuntimeError(f"Pathfinder error {r.status_code}: {r.text[:300]}")
 
         body = r.json()
-        if "playlistV2" not in body.get("data", {}) or not body["data"]["playlistV2"].get("content"):
+        if "playlistV2" not in body.get("data", {}) or not body["data"][
+            "playlistV2"
+        ].get("content"):
             raise RuntimeError(
                 f"Unexpected response (offset={offset}): {str(body)[:400]}"
             )
