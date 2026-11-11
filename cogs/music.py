@@ -16,10 +16,8 @@ import os
 import random
 import re
 import shutil
-import signal
 import sys
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, urlparse
 
@@ -27,7 +25,7 @@ import discord
 import googleapiclient.discovery
 from bs4 import BeautifulSoup
 from discord.ext import commands, tasks
-
+from utils.spotify_fetch import playlist_tracks
 from utils.config import (
     AVATAR_URL,
     BONUS_ROOM_TITLE,
@@ -37,7 +35,6 @@ from utils.config import (
     guild_macro,
 )
 from utils.pgdatabase import Postgres
-from utils.spotify_fetch import playlist_tracks
 
 YTDLP_SLOW_STARTUP_SECONDS = 10
 FFMPEG_SLOW_STARTUP_SECONDS = 5
@@ -52,19 +49,13 @@ YTDLP_MAX_TIMEOUT_SECONDS = 900
 # Intervalo de checagem do yt-dlp: curto para reagir rapido a skip/stop
 # (abort) e para medir a inatividade com precisao.
 YTDLP_POLL_INTERVAL_SECONDS = 1.0
+# Prioridade (nice) do yt-dlp e do deno que ele spawna: quanto maior, menor a
+# prioridade de CPU, para nao competir com o ffmpeg durante a resolucao.
+YTDLP_NICE_LEVEL = 15
 # Reconexao de voz: quantas tentativas e quanto esperar entre elas.
 VOICE_CONNECT_ATTEMPTS = 3
 VOICE_RECONNECT_DELAY_SECONDS = 2.0
 MAX_RESOLVE_ATTEMPTS = 10
-# Teto de tempo total para resolver as proximas faixas de uma guild (e para
-# esperar o slot global). Sem isso, MAX_RESOLVE_ATTEMPTS x timeout por faixa
-# (~90s) deixava a guild "digitando" por ~15 min segurando o unico slot.
-RESOLVE_TOTAL_BUDGET_SECONDS = 120
-# Se a resolucao estourar o orcamento, a guild tenta de novo sozinha depois
-# deste tempo (dobra a cada falha, ate o maximo), em vez de ficar muda ate
-# alguem mandar `mgy tocar`.
-RESOLVE_RETRY_BASE_SECONDS = 20
-RESOLVE_RETRY_MAX_SECONDS = 300
 MASHUP_SCAN_LIMIT = 100
 # Validade das stream URLs: lemos o vencimento exato do campo "expire" que o
 # proprio googlevideo embute na URL. A idade maxima so e usada como fallback
@@ -95,59 +86,8 @@ DROPBOX_FILE = os.path.abspath(
 log = logging.getLogger("music")
 
 
-def _env_int(name: str, default: int, minimum: int = 0) -> int:
-    """Le um inteiro do ambiente, com fallback seguro para valor invalido."""
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return max(minimum, int(raw))
-    except ValueError:
-        log.warning("Valor invalido para %s=%r; usando %s", name, raw, default)
-        return default
-
-
-# A maquina alvo e pequena (compartilhada, ~512MB). Cada extracao sobe um
-# processo Python do yt-dlp e, em desafios JS do YouTube, um runtime JS (qjs).
-# Rodar mais de uma ao mesmo tempo estoura a RAM e trava a maquina inteira,
-# entao o padrao e 1 (fila global de extracoes). Ajuste com
-# YTDLP_MAX_CONCURRENT.
-YTDLP_MAX_CONCURRENT = _env_int("YTDLP_MAX_CONCURRENT", 1, minimum=1)
-# Salvaguarda extra: se a memoria disponivel do sistema cair abaixo disso
-# durante uma extracao, o yt-dlp e morto em vez de empurrar a maquina para o
-# swap. 0 desativa. Sem /proc a checagem e ignorada.
-YTDLP_MIN_AVAILABLE_MB = _env_int("YTDLP_MIN_AVAILABLE_MB", 64)
-# Prioridade (nice) do yt-dlp e do runtime JS que ele spawna. Era 15, mas com
-# um unico core compartilhado isso deixava o yt-dlp sem CPU: ele nao imprimia
-# nada e o timeout de 90s matava a extracao. 5 ainda protege o ffmpeg sem
-# starvar a extracao. 0 desativa.
-YTDLP_NICE_LEVEL = _env_int("YTDLP_NICE_LEVEL", 5)
-# O prefetch roda junto com o ffmpeg, entao a resolucao fica bem mais lenta que
-# com a maquina livre (o desafio JS do quickjs ja levou ~66s sozinho). Como
-# ninguem esta esperando, o prefetch ganha mais folga sem atrasar o playback,
-# que continua usando YTDLP_IDLE_TIMEOUT_SECONDS.
-PREFETCH_IDLE_TIMEOUT_SECONDS = _env_int(
-    "YTDLP_PREFETCH_IDLE_TIMEOUT_SECONDS", 240, minimum=1
-)
-
-# Uma extracao por vez no maximo; o prefetch usa try-acquire para nunca
-# segurar o unico slot enquanto outra guild quer comecar a tocar.
-_extract_slots = asyncio.Semaphore(YTDLP_MAX_CONCURRENT)
-# Setado quando uma reproducao esta esperando o slot: o prefetch em andamento
-# se mata na hora para liberar a vaga (playback sempre tem prioridade).
-_prefetch_abort = asyncio.Event()
-
-
 class ResolutionAborted(Exception):
     """Levantada quando skip/stop cancela uma resolucao yt-dlp em andamento."""
-
-
-class ResolutionDeferred(Exception):
-    """Nao havia slot global de extracao livre (usado pelo prefetch).
-
-    Em vez de esperar (e atrasar a reprodução de outra guild), a resolucao
-    antecipada simplesmente desiste; a faixa e resolvida na hora de tocar.
-    """
 
 
 class BotCheckError(RuntimeError):
@@ -170,11 +110,11 @@ BROWSER_HEADERS = {
 }
 
 # Ordem importa: o yt-dlp tenta os clientes na ordem e usa o primeiro que
-# retorna formatos. web_embedded nao exige PO token, entao fica na frente;
-# tv_downgraded/web suportam cookies. visionos sai da lista: nao suporta
-# cookies (o yt-dlp o descarta com login) e sem login leva bot check.
-# android/ios tambem saem: hoje exigem PO token e nao suportam cookies.
-YOUTUBE_PLAYER_CLIENTS = ["web_embedded", "tv_downgraded", "web"]
+# retorna formatos. visionos e web_embedded nao exigem PO token (o visionos
+# nem JS player), entao ficam na frente; tv_downgraded/web suportam cookies.
+# android/ios saem da lista: hoje exigem PO token e nao suportam cookies
+# (yt-dlp os descarta quando ha login). Isso segue os defaults de 2026.
+YOUTUBE_PLAYER_CLIENTS = ["visionos", "web_embedded", "tv_downgraded", "web"]
 
 # Cookies de login do YouTube expiram/rotacionam com o tempo; o sintoma de
 # cookies ausentes/expirados e o "Sign in to confirm you're not a bot".
@@ -187,17 +127,11 @@ _COOKIE_STALE_WARNING = (
     "`mgy cookies` (anexe um cookies.txt novo)."
 )
 
-# Runtime JS para os desafios do YouTube. Padrao quickjs (`qjs` no PATH): o
-# deno foi descontinuado pelo yt-dlp, pesa ~100MB por resolucao e era o gargalo
-# nas duas guilds. "auto"/"default" deixa o yt-dlp escolher (deno hoje);
-# vazio tambem usa quickjs. Aceita RUNTIME ou RUNTIME:PATH, separados por
-# virgula (ex.: YTDLP_JS_RUNTIMES=quickjs:C:\qjs\qjs.exe).
-_js_runtimes_env = os.environ.get("YTDLP_JS_RUNTIMES", "").strip() or "quickjs"
-YTDLP_JS_RUNTIMES = (
-    []
-    if _js_runtimes_env.lower() in ("auto", "default")
-    else [runtime.strip() for runtime in _js_runtimes_env.split(",") if runtime.strip()]
-)
+YTDLP_JS_RUNTIMES = [
+    runtime.strip()
+    for runtime in os.environ.get("YTDLP_JS_RUNTIMES", "").split(",")
+    if runtime.strip()
+]
 
 ytdl_format_options = {
     "format": "bestaudio[ext=webm]/bestaudio/best",
@@ -284,9 +218,6 @@ class GuildPlayer:
     reconnect_task: asyncio.Task | None = None
     # Identifica o player atual; callbacks "after" antigos sao descartados.
     play_generation: int = 0
-    # Retomada automatica depois de uma resolucao que estourou o tempo.
-    retry_task: asyncio.Task | None = None
-    retry_attempts: int = 0
 
 
 def _url_expires_at(url: str) -> float | None:
@@ -327,9 +258,6 @@ def _is_track_fresh(track: Track) -> bool:
 
 _cookie_cache = {"mtime": None, "value": ""}
 _mashups_cache: list[str] = []
-# Titulos de mashups ja descobertos (link -> titulo), para o comando nao
-# re-extrair ate 100 links com o yt-dlp a cada uso.
-_mashup_titles: dict[str, str] = {}
 
 
 def _extract_cookie_header(path: str) -> str:
@@ -453,8 +381,8 @@ def _has_login_cookies() -> bool:
 
 
 # mtime do cookies.txt no momento em que ele foi rejeitado num bot check.
-# Enquanto o arquivo nao mudar, o embed de "tocando agora" avisa a Staff para
-# trocar os cookies (comando ``mgy cookies``).
+# Enquanto o arquivo nao mudar, extraimos sem cookies (clientes sem cookie,
+# tipo o visionos) para nao pagar a tentativa falha em toda musica.
 _cookies_rejected = {"mtime": None}
 
 
@@ -494,110 +422,12 @@ def _build_ffmpeg_headers(data: dict) -> dict:
     return headers
 
 
-_MEMINFO_AVAILABLE = re.compile(r"^MemAvailable:\s+(\d+)\s+kB", re.MULTILINE)
-
-
-def _available_memory_mb() -> float | None:
-    """Memoria disponivel do sistema em MB (None quando nao da para saber)."""
-    try:
-        with open("/proc/meminfo", "r", encoding="ascii", errors="ignore") as handle:
-            head = handle.read(4096)
-    except OSError:
-        return None
-    match = _MEMINFO_AVAILABLE.search(head)
-    if match is None:
-        return None
-    return int(match.group(1)) / 1024.0
-
-
-def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
-    """Mata o yt-dlp E os filhos (deno), nao so o processo principal.
-
-    O subprocesso e criado em uma sessao propria (start_new_session), entao
-    ``killpg`` alcanca o deno que o yt-dlp lanca. Matar apenas o PID pai
-    deixava denos orfaos consumindo CPU/RAM ate a maquina travar.
-    """
-    if os.name == "posix" and hasattr(os, "killpg"):
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-            return
-        except (ProcessLookupError, PermissionError):
-            pass
-    try:
-        process.kill()
-    except ProcessLookupError:
-        pass
-
-
-async def _acquire_extract_slot(abort_event: asyncio.Event | None, wait: bool) -> None:
-    """Reserva o slot global de extracao; levanta se desistir.
-
-    Com ``wait=False`` (prefetch) e levantado :class:`ResolutionDeferred`
-    quando o slot esta ocupado, para a resolucao antecipada nunca atrasar a
-    reproducao de outra guild. Com ``wait=True`` espera em fatias curtas para
-    ainda respeitar skip/stop de imediato.
-    """
-    if not _extract_slots.locked():
-        await _extract_slots.acquire()
-        return
-
-    if not wait:
-        raise ResolutionDeferred("slot de extracao ocupado")
-
-    log.info("Aguardando slot de extracao yt-dlp (%s em uso)", YTDLP_MAX_CONCURRENT)
-    started = time.monotonic()
-    # Reproducao tem prioridade: mata o prefetch que estiver segurando o slot.
-    _prefetch_abort.set()
-    try:
-        while True:
-            if abort_event is not None and abort_event.is_set():
-                raise ResolutionAborted("slot")
-            try:
-                await asyncio.wait_for(_extract_slots.acquire(), timeout=0.5)
-                waited = time.monotonic() - started
-                if waited >= 1:
-                    log.info("Slot de extracao liberado apos %.0fs", waited)
-                return
-            except TimeoutError:
-                if time.monotonic() - started >= RESOLVE_TOTAL_BUDGET_SECONDS:
-                    log.warning(
-                        "Slot de extracao ocupado por %.0fs; desistindo desta faixa",
-                        RESOLVE_TOTAL_BUDGET_SECONDS,
-                    )
-                    raise TimeoutError("slot de extracao ocupado por muito tempo")
-                continue
-    finally:
-        _prefetch_abort.clear()
-
-
 async def _extract_info_isolated(
     url: str,
     idle_timeout: float = YTDLP_IDLE_TIMEOUT_SECONDS,
     max_timeout: float | None = YTDLP_MAX_TIMEOUT_SECONDS,
     abort_event: asyncio.Event | None = None,
     use_cookies: bool = True,
-    wait_for_slot: bool = True,
-) -> dict:
-    """Extrai metadados ocupando um slot global de extracao.
-
-    O numero de yt-dlp simultaneos fica limitado a ``YTDLP_MAX_CONCURRENT``
-    (padrao 1) porque cada processo custa RAM demais para uma maquina pequena.
-    """
-    await _acquire_extract_slot(abort_event, wait_for_slot)
-    try:
-        return await _run_ytdlp_extraction(
-            url, idle_timeout, max_timeout, abort_event, use_cookies
-        )
-    finally:
-        _extract_slots.release()
-
-
-async def _run_ytdlp_extraction(
-    url: str,
-    idle_timeout: float,
-    max_timeout: float | None,
-    abort_event: asyncio.Event | None,
-    use_cookies: bool,
 ) -> dict:
     """Extrai metadados em um subprocesso que pode ser morto sem travar o bot.
 
@@ -609,7 +439,9 @@ async def _run_ytdlp_extraction(
     Se ``abort_event`` for setado (por skip/stop), o subprocesso e morto e
     :class:`ResolutionAborted` e levantada.
 
-    ``use_cookies=False`` extrai sem ``--cookies`` (quando nao ha cookies.txt).
+    ``use_cookies=False`` forca uma extracao anonima (sem ``--cookies``): sem
+    login o yt-dlp usa clientes sem cookie (ex. visionos), util como fallback
+    quando os cookies estao ausentes/expirados.
 
     --verbose e sempre usado para forcar o yt-dlp a enviar as mensagens para
     o stderr, deixando o stdout apenas com o JSON (sem --quiet o yt-dlp
@@ -645,35 +477,21 @@ async def _run_ytdlp_extraction(
             command.extend(["--js-runtimes", runtime])
     command.append(url)
 
-    # O yt-dlp (e o runtime JS que ele spawna para resolver os challenges do
+    # O yt-dlp (e o deno que ele spawna para resolver JS challenges do
     # YouTube) roda em prioridade menor que o ffmpeg, para nao roubar CPU
     # do audio durante a resolucao do prefetch.
-    if YTDLP_NICE_LEVEL > 0 and sys.platform != "win32" and shutil.which("nice"):
+    if sys.platform != "win32" and shutil.which("nice"):
         command = ["nice", "-n", str(YTDLP_NICE_LEVEL), *command]
-
-    if YTDLP_MIN_AVAILABLE_MB > 0:
-        available = _available_memory_mb()
-        if available is not None and available < YTDLP_MIN_AVAILABLE_MB:
-            log.warning(
-                "Memoria disponivel baixa (%.0fMB) antes de resolver %s; "
-                "a extracao sera abortada se piorar",
-                available,
-                url,
-            )
 
     process = await asyncio.create_subprocess_exec(
         *command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=1024 * 1024,
-        # Sessao propria: permite matar o yt-dlp e o deno que ele lanca juntos.
-        start_new_session=os.name == "posix",
     )
 
     stdout_chunks: list[bytes] = []
-    # Bounded: o --verbose pode imprimir centenas de linhas por extracao e a
-    # lista crescia sem limite (memoria valiosa numa maquina de 512MB).
-    stderr_lines: deque[str] = deque(maxlen=200)
+    stderr_lines: list[str] = []
     last_activity = time.monotonic()
 
     async def _drain_stdout(stream):
@@ -713,7 +531,7 @@ async def _run_ytdlp_extraction(
     wait_task = asyncio.create_task(process.wait())
 
     def _stderr_tail(limit: int = 50) -> str:
-        return "\n".join(list(stderr_lines)[-limit:]) or "(sem saida do yt-dlp)"
+        return "\n".join(stderr_lines[-limit:]) or "(sem saida do yt-dlp)"
 
     timeout_reason: str | None = None
     aborted = False
@@ -730,13 +548,6 @@ async def _run_ytdlp_extraction(
                 timeout_reason = f"sem saida por {idle_timeout:.0f}s"
                 break
 
-            if YTDLP_MIN_AVAILABLE_MB > 0:
-                available = _available_memory_mb()
-                if available is not None and available < YTDLP_MIN_AVAILABLE_MB:
-                    # A maquina esta a beira do swap: nao adianta esperar.
-                    timeout_reason = f"memoria disponivel baixa ({available:.0f}MB)"
-                    break
-
             wait_budget = min(idle_left, YTDLP_POLL_INTERVAL_SECONDS)
             if max_timeout is not None:
                 max_left = max_timeout - (now - started)
@@ -752,27 +563,21 @@ async def _run_ytdlp_extraction(
                 # Sem saida dentro da janela: reavalia progresso/abort.
                 continue
     except asyncio.CancelledError:
-        _kill_process_tree(process)
-        for task in (stdout_task, stderr_task, wait_task):
-            task.cancel()
-        await asyncio.gather(
-            stdout_task, stderr_task, wait_task, return_exceptions=True
-        )
+        process.kill()
+        wait_task.cancel()
+        stdout_task.cancel()
+        stderr_task.cancel()
         raise
 
     if aborted:
-        _kill_process_tree(process)
+        process.kill()
         await wait_task
         await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
-        if abort_event is _prefetch_abort:
-            # Playback precisa do slot: prefetch sai de cena sem barulho.
-            log.info("Prefetch de %s interrompido para liberar o slot", url)
-            raise ResolutionDeferred(url)
         log.info("yt-dlp abortado para %s. Ultimas linhas:\n%s", url, _stderr_tail(10))
         raise ResolutionAborted(url)
 
     if timeout_reason is not None:
-        _kill_process_tree(process)
+        process.kill()
         await wait_task
         await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
         log.error(
@@ -884,15 +689,13 @@ class Music(commands.Cog):
         idle_timeout: float = YTDLP_IDLE_TIMEOUT_SECONDS,
         max_timeout: float | None = YTDLP_MAX_TIMEOUT_SECONDS,
         abort_event: asyncio.Event | None = None,
-        wait_for_slot: bool = True,
     ) -> Track | None:
         """Resolve uma Track via yt-dlp. Retorna None em caso de falha.
 
-        Usa cookies quando disponiveis. Num bot check, marca os cookies como
-        ruins (para o embed avisar a Staff) e levanta :class:`BotCheckError`.
-
-        ``wait_for_slot=False`` (prefetch) desiste quando o slot global de
-        extracao esta ocupado, em vez de esperar e atrasar outra guild.
+        Usa cookies quando disponiveis. Se o YouTube responder com bot check,
+        tenta de novo sem login (clientes sem cookie, ex. visionos) e marca os
+        cookies como ruins. Levanta :class:`BotCheckError` quando nem o fallback
+        sem cookie consegue extrair.
         """
         if _is_track_fresh(track):
             return track
@@ -900,25 +703,15 @@ class Music(commands.Cog):
             log.info("Stream URL de '%s' expirou; resolvendo novamente", track.query)
             track.stream_url = None
 
-        use_cookies = _has_login_cookies()
+        use_cookies = _has_login_cookies() and not _cookies_rejected_for_current_file()
         started_at = time.monotonic()
         try:
-            data = await _extract_info_isolated(
-                track.query,
-                idle_timeout,
-                max_timeout,
-                abort_event,
-                use_cookies=use_cookies,
-                wait_for_slot=wait_for_slot,
+            data = await self._extract_with_cookie_fallback(
+                track, idle_timeout, max_timeout, abort_event, use_cookies
             )
         except ResolutionAborted:
             raise
-        except ResolutionDeferred:
-            log.debug("Prefetch adiado (slot ocupado) para '%s'", track.query)
-            return None
         except BotCheckError:
-            if use_cookies:
-                _mark_cookies_rejected()
             raise
         except Exception as e:  # pylint: disable=broad-exception-caught
             log.error("Erro ao adquirir video da URL '%s': %s", track.query, e)
@@ -942,6 +735,49 @@ class Music(commands.Cog):
         if elapsed >= YTDLP_SLOW_STARTUP_SECONDS:
             log.warning("yt-dlp startup levou %.1fs para %s", elapsed, track.query)
         return track
+
+    async def _extract_with_cookie_fallback(
+        self,
+        track: Track,
+        idle_timeout: float,
+        max_timeout: float | None,
+        abort_event: asyncio.Event | None,
+        use_cookies: bool,
+    ) -> dict:
+        """Extrai a faixa; se o login for recusado, tenta anonimo (sem cookies).
+
+        Sem login o yt-dlp passa a usar clientes sem cookie (ex. visionos), o
+        que costuma escapar do bot check. Marcamos os cookies atuais como ruins
+        assim que o login e recusado, para as proximas resolucoes irem direto no
+        modo anonimo (mais rapido) e para o embed avisar a Staff, ate o arquivo
+        ser trocado (comando ``mgy cookies``).
+        """
+        try:
+            return await _extract_info_isolated(
+                track.query,
+                idle_timeout,
+                max_timeout,
+                abort_event,
+                use_cookies=use_cookies,
+            )
+        except BotCheckError:
+            if not use_cookies:
+                raise
+            log.warning(
+                "Cookies do YouTube recusados (bot check) para '%s'; tentando sem login",
+                track.query,
+            )
+            if _mark_cookies_rejected():
+                log.warning(
+                    "Extraindo sem cookies ate o cookies.txt ser atualizado (mgy cookies)"
+                )
+            return await _extract_info_isolated(
+                track.query,
+                idle_timeout,
+                max_timeout,
+                abort_event,
+                use_cookies=False,
+            )
 
     def _build_source(self, track: Track, state: GuildPlayer, extra_before: str = ""):
         """Cria o FFmpegPCMAudio para uma Track ja resolvida."""
@@ -1021,11 +857,6 @@ class Music(commands.Cog):
     async def _disconnect_nolock(self, guild_id: int, state: GuildPlayer):
         """Desconecta e limpa o estado. Deve ser chamado com o lock adquirido."""
         self._cancel_prefetch(state)
-        retry = state.retry_task
-        state.retry_task = None
-        state.retry_attempts = 0
-        if retry is not None and not retry.done():
-            retry.cancel()
         state.current = None
         state.queue.clear()
         state.now_playing = None
@@ -1134,39 +965,6 @@ class Music(commands.Cog):
         if task is not None and not task.done():
             task.cancel()
 
-    def _schedule_advance_retry(self, guild_id: int, state: GuildPlayer):
-        """Agenda uma nova tentativa depois de a resolucao estourar o tempo."""
-        if state.retry_task is not None and not state.retry_task.done():
-            return
-        delay = min(
-            RESOLVE_RETRY_BASE_SECONDS * (2**state.retry_attempts),
-            RESOLVE_RETRY_MAX_SECONDS,
-        )
-        state.retry_attempts += 1
-        log.info(
-            "Fila da guild %s parada; tentando de novo em %.0fs (tentativa %d)",
-            guild_id,
-            delay,
-            state.retry_attempts,
-        )
-        state.retry_task = asyncio.create_task(
-            self._retry_advance(guild_id, state, delay)
-        )
-
-    async def _retry_advance(self, guild_id: int, state: GuildPlayer, delay: float):
-        await asyncio.sleep(delay)
-        async with state.lock:
-            # Esta task e a retomada atual: libera o campo para que uma nova
-            # falha consiga agendar a proxima tentativa.
-            state.retry_task = None
-            if state.current is not None or state.voice is None or not state.queue:
-                return
-            log.info("Retomando a fila da guild %s", guild_id)
-            try:
-                await self._advance_locked(guild_id, state)
-            except Exception as e:  # pylint: disable=broad-exception-caught
-                log.error("Erro ao retomar a fila da guild %s: %s", guild_id, e)
-
     def _abort_resolution(self, state: GuildPlayer) -> bool:
         """Pede para a resolucao yt-dlp em andamento parar, sem esperar o lock.
 
@@ -1186,23 +984,14 @@ class Music(commands.Cog):
         state.prefetch_task = asyncio.create_task(self._prefetch_next(guild_id, state))
 
     async def _prefetch_next(self, guild_id: int, state: GuildPlayer):
-        """Resolve a proxima faixa da fila (mutando o proprio objeto da fila).
-
-        Usa o slot global de extracao apenas se estiver livre: prefetch nunca
-        deve segurar o unico slot enquanto outra guild espera para tocar.
-        """
+        """Resolve a proxima faixa da fila (mutando o proprio objeto da fila)."""
         if not state.queue:
             return
         track = state.queue[0]
         if _is_track_fresh(track):
             return
         try:
-            resolved = await self._resolve_track(
-                track,
-                idle_timeout=PREFETCH_IDLE_TIMEOUT_SECONDS,
-                abort_event=_prefetch_abort,
-                wait_for_slot=False,
-            )
+            resolved = await self._resolve_track(track)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # pylint: disable=broad-exception-caught
@@ -1248,20 +1037,7 @@ class Music(commands.Cog):
             return
 
         attempts = 0
-        # Orcamento total: sem isso, varias tentativas lentas (timeout de 90s
-        # cada) deixavam a guild "digitando" por ~15 min segurando o slot.
-        deadline = time.monotonic() + RESOLVE_TOTAL_BUDGET_SECONDS
         while state.queue and attempts < MAX_RESOLVE_ATTEMPTS:
-            if time.monotonic() >= deadline:
-                log.warning(
-                    "Limite de %.0fs para resolver a proxima faixa atingido "
-                    "(%d restantes na fila, guild=%s); mantendo a fila",
-                    RESOLVE_TOTAL_BUDGET_SECONDS,
-                    len(state.queue),
-                    guild_id,
-                )
-                self._schedule_advance_retry(guild_id, state)
-                return
             attempts += 1
             track = state.queue.pop(0)
             state.resolving = True
@@ -1304,7 +1080,6 @@ class Music(commands.Cog):
 
             self._apply_volume(state)
             log.info("Tocando %s", resolved.title)
-            state.retry_attempts = 0
             if resolved.title == BONUS_ROOM_TITLE:
                 asyncio.create_task(self._enable_double_xp())
             await self._announce_locked(guild_id, state, resolved)
@@ -1317,7 +1092,6 @@ class Music(commands.Cog):
                 MAX_RESOLVE_ATTEMPTS,
                 len(state.queue),
             )
-            self._schedule_advance_retry(guild_id, state)
             return
         await self._disconnect_nolock(guild_id, state)
 
@@ -1441,7 +1215,7 @@ class Music(commands.Cog):
             return 0
         accepted = tracks[:available]
         if front:
-            state.queue[0:0] = accepted
+            state.queue[0:0] = list(reversed(accepted))
         else:
             state.queue.extend(accepted)
         return len(accepted)
@@ -1672,48 +1446,28 @@ class Music(commands.Cog):
             tracks.extend(Track(query.query, query.is_search) for _ in range(repeat))
 
         added = await self._enqueue(state, tracks, front)
-        return added, front
-
-    def _prefetch_after_enqueue(
-        self, guild_id: int, state: GuildPlayer, front: bool = False
-    ):
-        """Resolve a proxima faixa em segundo plano quando algo ja esta tocando.
-
-        Sem isso, uma musica adicionada durante a reproducao so comecava a ser
-        resolvida quando a atual terminava, e a espera do yt-dlp virava
-        silencio. Com ``front`` a cabeca da fila mudou, entao um prefetch em
-        andamento ficou obsoleto e precisa recomecar.
-        """
-        if not state.voice or not (
-            state.voice.is_playing() or state.voice.is_paused()
-        ):
-            return
-        task = state.prefetch_task
-        if front or task is None or task.done():
-            self._schedule_prefetch(guild_id, state)
+        return added
 
     @commands.command(aliases=["paly", "ply", "p"])
     async def play(self, ctx: commands.Context, url: str, *args):
         """Toca a partir uma url ou pesquisa.
 
         Args opcionais:
-        -f - adiciona no inicio da fila (toca a seguir)
         -shuffle - ordem aleatoria
         -n - numero de repetições
         """
         state = self._state(ctx.guild.id)
         async with ctx.typing():
             state.now_playing = None
-            added, front = await self._parse_and_enqueue(ctx, url, args)
+            added = await self._parse_and_enqueue(ctx, url, args)
 
             if "-shuffle" in args:
                 await self.randomizequeue(ctx)
 
             if state.voice and (state.voice.is_playing() or state.voice.is_paused()):
                 log.info("Esta tocando, adicionando a queue")
-                position = 1 if front else len(state.queue)
+                position = 1 if "-f" in args else len(state.queue) - 1
                 await ctx.send(f"```Adicionado à fila, posição: {position}```")
-                self._prefetch_after_enqueue(ctx.guild.id, state, front=front)
             else:
                 log.info("Nao esta tocando, comecando agora")
                 if added == 0:
@@ -1842,9 +1596,7 @@ class Music(commands.Cog):
             log.info("Iniciando busca por mashups")
 
             try:
-                # Parsear 1.3MB de HTML com BeautifulSoup trava o event loop
-                # inteiro (e todas as guilds) por instantes: vai para a thread.
-                mashups = await asyncio.to_thread(_load_mashups)
+                mashups = _load_mashups()
             except OSError as e:
                 log.error("Erro ao ler Dropbox.html: %s", e)
                 return await ctx.send("```Lista de mashups indisponível```")
@@ -1865,16 +1617,12 @@ class Music(commands.Cog):
                 found = False
                 tracks = []
                 for link in mashups[:MASHUP_SCAN_LIMIT]:
-                    nome = _mashup_titles.get(link)
-                    if not nome:
-                        try:
-                            info = await _extract_info_isolated(link)
-                        except Exception as exc:  # pylint: disable=broad-exception-caught
-                            log.warning("Erro ao buscar mashup '%s': %s", link, exc)
-                            continue
-                        nome = (info or {}).get("title") or ""
-                        if nome:
-                            _mashup_titles[link] = nome
+                    try:
+                        info = await _extract_info_isolated(link)
+                    except Exception as exc:  # pylint: disable=broad-exception-caught
+                        log.warning("Erro ao buscar mashup '%s': %s", link, exc)
+                        continue
+                    nome = info.get("title") if info else None
                     if nome and nome.startswith(num):
                         log.info("Encontrou: %s", nome)
                         tracks = [Track(link)]
@@ -1890,7 +1638,6 @@ class Music(commands.Cog):
                 await ctx.send(
                     f"```Adicionado {num} à lista. Total na lista: {len(state.queue)}```"
                 )
-                self._prefetch_after_enqueue(ctx.guild.id, state)
             else:
                 await self.tocar(ctx)
 
@@ -1928,7 +1675,6 @@ class Music(commands.Cog):
                 await ctx.send(
                     f"```Adicionado {quan} Bonus Room à lista. Total na lista: {len(state.queue)}```"
                 )
-                self._prefetch_after_enqueue(ctx.guild.id, state)
             else:
                 # A resolucao da primeira faixa fica dentro do typing.
                 await self.tocar(ctx)
@@ -1960,7 +1706,7 @@ class Music(commands.Cog):
         state = self._state(ctx.guild.id)
         state.channel = ctx.channel
         async with ctx.typing():
-            _, front = await self._parse_and_enqueue(ctx, url, args)
+            await self._parse_and_enqueue(ctx, url, args)
 
             if "-shuffle" in args:
                 await self.randomizequeue(ctx)
@@ -1969,7 +1715,6 @@ class Music(commands.Cog):
                 await ctx.send(
                     f"```Adicionado {resultado[0]['name']} à lista. Total na lista: {len(state.queue)}```"
                 )
-                self._prefetch_after_enqueue(ctx.guild.id, state, front=front)
             else:
                 # A resolucao da primeira faixa fica dentro do typing.
                 await self.tocar(ctx)
