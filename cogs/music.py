@@ -122,6 +122,13 @@ YTDLP_MIN_AVAILABLE_MB = _env_int("YTDLP_MIN_AVAILABLE_MB", 64)
 # nada e o timeout de 90s matava a extracao. 5 ainda protege o ffmpeg sem
 # starvar a extracao. 0 desativa.
 YTDLP_NICE_LEVEL = _env_int("YTDLP_NICE_LEVEL", 5)
+# O prefetch roda junto com o ffmpeg, entao a resolucao fica bem mais lenta que
+# com a maquina livre (o desafio JS do quickjs ja levou ~66s sozinho). Como
+# ninguem esta esperando, o prefetch ganha mais folga sem atrasar o playback,
+# que continua usando YTDLP_IDLE_TIMEOUT_SECONDS.
+PREFETCH_IDLE_TIMEOUT_SECONDS = _env_int(
+    "YTDLP_PREFETCH_IDLE_TIMEOUT_SECONDS", 240, minimum=1
+)
 
 # Uma extracao por vez no maximo; o prefetch usa try-acquire para nunca
 # segurar o unico slot enquanto outra guild quer comecar a tocar.
@@ -1191,7 +1198,10 @@ class Music(commands.Cog):
             return
         try:
             resolved = await self._resolve_track(
-                track, abort_event=_prefetch_abort, wait_for_slot=False
+                track,
+                idle_timeout=PREFETCH_IDLE_TIMEOUT_SECONDS,
+                abort_event=_prefetch_abort,
+                wait_for_slot=False,
             )
         except asyncio.CancelledError:
             raise
@@ -1431,7 +1441,7 @@ class Music(commands.Cog):
             return 0
         accepted = tracks[:available]
         if front:
-            state.queue[0:0] = list(reversed(accepted))
+            state.queue[0:0] = accepted
         else:
             state.queue.extend(accepted)
         return len(accepted)
@@ -1662,28 +1672,48 @@ class Music(commands.Cog):
             tracks.extend(Track(query.query, query.is_search) for _ in range(repeat))
 
         added = await self._enqueue(state, tracks, front)
-        return added
+        return added, front
+
+    def _prefetch_after_enqueue(
+        self, guild_id: int, state: GuildPlayer, front: bool = False
+    ):
+        """Resolve a proxima faixa em segundo plano quando algo ja esta tocando.
+
+        Sem isso, uma musica adicionada durante a reproducao so comecava a ser
+        resolvida quando a atual terminava, e a espera do yt-dlp virava
+        silencio. Com ``front`` a cabeca da fila mudou, entao um prefetch em
+        andamento ficou obsoleto e precisa recomecar.
+        """
+        if not state.voice or not (
+            state.voice.is_playing() or state.voice.is_paused()
+        ):
+            return
+        task = state.prefetch_task
+        if front or task is None or task.done():
+            self._schedule_prefetch(guild_id, state)
 
     @commands.command(aliases=["paly", "ply", "p"])
     async def play(self, ctx: commands.Context, url: str, *args):
         """Toca a partir uma url ou pesquisa.
 
         Args opcionais:
+        -f - adiciona no inicio da fila (toca a seguir)
         -shuffle - ordem aleatoria
         -n - numero de repetições
         """
         state = self._state(ctx.guild.id)
         async with ctx.typing():
             state.now_playing = None
-            added = await self._parse_and_enqueue(ctx, url, args)
+            added, front = await self._parse_and_enqueue(ctx, url, args)
 
             if "-shuffle" in args:
                 await self.randomizequeue(ctx)
 
             if state.voice and (state.voice.is_playing() or state.voice.is_paused()):
                 log.info("Esta tocando, adicionando a queue")
-                position = 1 if "-f" in args else len(state.queue) - 1
+                position = 1 if front else len(state.queue)
                 await ctx.send(f"```Adicionado à fila, posição: {position}```")
+                self._prefetch_after_enqueue(ctx.guild.id, state, front=front)
             else:
                 log.info("Nao esta tocando, comecando agora")
                 if added == 0:
@@ -1860,6 +1890,7 @@ class Music(commands.Cog):
                 await ctx.send(
                     f"```Adicionado {num} à lista. Total na lista: {len(state.queue)}```"
                 )
+                self._prefetch_after_enqueue(ctx.guild.id, state)
             else:
                 await self.tocar(ctx)
 
@@ -1897,6 +1928,7 @@ class Music(commands.Cog):
                 await ctx.send(
                     f"```Adicionado {quan} Bonus Room à lista. Total na lista: {len(state.queue)}```"
                 )
+                self._prefetch_after_enqueue(ctx.guild.id, state)
             else:
                 # A resolucao da primeira faixa fica dentro do typing.
                 await self.tocar(ctx)
@@ -1928,7 +1960,7 @@ class Music(commands.Cog):
         state = self._state(ctx.guild.id)
         state.channel = ctx.channel
         async with ctx.typing():
-            await self._parse_and_enqueue(ctx, url, args)
+            _, front = await self._parse_and_enqueue(ctx, url, args)
 
             if "-shuffle" in args:
                 await self.randomizequeue(ctx)
@@ -1937,6 +1969,7 @@ class Music(commands.Cog):
                 await ctx.send(
                     f"```Adicionado {resultado[0]['name']} à lista. Total na lista: {len(state.queue)}```"
                 )
+                self._prefetch_after_enqueue(ctx.guild.id, state, front=front)
             else:
                 # A resolucao da primeira faixa fica dentro do typing.
                 await self.tocar(ctx)
