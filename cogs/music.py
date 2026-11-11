@@ -25,7 +25,7 @@ import discord
 import googleapiclient.discovery
 from bs4 import BeautifulSoup
 from discord.ext import commands, tasks
-from utils.spotify_fetch import playlist_tracks
+
 from utils.config import (
     AVATAR_URL,
     BONUS_ROOM_TITLE,
@@ -35,6 +35,7 @@ from utils.config import (
     guild_macro,
 )
 from utils.pgdatabase import Postgres
+from utils.spotify_fetch import playlist_tracks
 
 YTDLP_SLOW_STARTUP_SECONDS = 10
 FFMPEG_SLOW_STARTUP_SECONDS = 5
@@ -91,11 +92,7 @@ class ResolutionAborted(Exception):
 
 
 class BotCheckError(RuntimeError):
-    """O yt-dlp exigiu login do YouTube (bot check / LOGIN_REQUIRED).
-
-    Levantada quando nem os cookies atuais nem a tentativa sem login
-    (clientes sem cookie, como o visionos) conseguiram extrair a faixa.
-    """
+    """O yt-dlp exigiu login do YouTube (bot check / LOGIN_REQUIRED)."""
 
 
 BROWSER_HEADERS = {
@@ -110,11 +107,10 @@ BROWSER_HEADERS = {
 }
 
 # Ordem importa: o yt-dlp tenta os clientes na ordem e usa o primeiro que
-# retorna formatos. visionos e web_embedded nao exigem PO token (o visionos
-# nem JS player), entao ficam na frente; tv_downgraded/web suportam cookies.
-# android/ios saem da lista: hoje exigem PO token e nao suportam cookies
-# (yt-dlp os descarta quando ha login). Isso segue os defaults de 2026.
-YOUTUBE_PLAYER_CLIENTS = ["visionos", "web_embedded", "tv_downgraded", "web"]
+# retorna formatos. web_embedded nao exige PO token, entao fica na frente;
+# tv_downgraded/web suportam cookies. android/ios saem da lista: hoje exigem
+# PO token e nao suportam cookies (yt-dlp os descarta quando ha login).
+YOUTUBE_PLAYER_CLIENTS = ["web_embedded", "tv_downgraded", "web"]
 
 # Cookies de login do YouTube expiram/rotacionam com o tempo; o sintoma de
 # cookies ausentes/expirados e o "Sign in to confirm you're not a bot".
@@ -381,8 +377,8 @@ def _has_login_cookies() -> bool:
 
 
 # mtime do cookies.txt no momento em que ele foi rejeitado num bot check.
-# Enquanto o arquivo nao mudar, extraimos sem cookies (clientes sem cookie,
-# tipo o visionos) para nao pagar a tentativa falha em toda musica.
+# Enquanto o arquivo nao mudar, o embed de "tocando agora" avisa a Staff para
+# trocar os cookies (comando ``mgy cookies``).
 _cookies_rejected = {"mtime": None}
 
 
@@ -422,12 +418,30 @@ def _build_ffmpeg_headers(data: dict) -> dict:
     return headers
 
 
+def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
+    """Mata o yt-dlp E os filhos (deno), nao so o processo principal.
+
+    O subprocesso e criado em uma sessao propria (start_new_session), entao
+    ``killpg`` alcanca o deno que o yt-dlp lanca. Matar apenas o PID pai
+    deixava denos orfaos consumindo CPU/RAM ate a maquina travar.
+    """
+    if os.name == "posix" and hasattr(os, "killpg"):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError):
+            pass
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+
+
 async def _extract_info_isolated(
     url: str,
     idle_timeout: float = YTDLP_IDLE_TIMEOUT_SECONDS,
     max_timeout: float | None = YTDLP_MAX_TIMEOUT_SECONDS,
     abort_event: asyncio.Event | None = None,
-    use_cookies: bool = True,
 ) -> dict:
     """Extrai metadados em um subprocesso que pode ser morto sem travar o bot.
 
@@ -438,10 +452,6 @@ async def _extract_info_isolated(
 
     Se ``abort_event`` for setado (por skip/stop), o subprocesso e morto e
     :class:`ResolutionAborted` e levantada.
-
-    ``use_cookies=False`` forca uma extracao anonima (sem ``--cookies``): sem
-    login o yt-dlp usa clientes sem cookie (ex. visionos), util como fallback
-    quando os cookies estao ausentes/expirados.
 
     --verbose e sempre usado para forcar o yt-dlp a enviar as mensagens para
     o stderr, deixando o stdout apenas com o JSON (sem --quiet o yt-dlp
@@ -468,7 +478,7 @@ async def _extract_info_isolated(
         "youtube:player_client=" + ",".join(YOUTUBE_PLAYER_CLIENTS),
         "--verbose",
     ]
-    if use_cookies and os.path.exists(COOKIES_FILE):
+    if os.path.exists(COOKIES_FILE):
         command.extend(["--cookies", COOKIES_FILE])
     _log_cookie_status_once()
     if YTDLP_JS_RUNTIMES:
@@ -563,21 +573,23 @@ async def _extract_info_isolated(
                 # Sem saida dentro da janela: reavalia progresso/abort.
                 continue
     except asyncio.CancelledError:
-        process.kill()
-        wait_task.cancel()
-        stdout_task.cancel()
-        stderr_task.cancel()
+        _kill_process_tree(process)
+        for task in (stdout_task, stderr_task, wait_task):
+            task.cancel()
+        await asyncio.gather(
+            stdout_task, stderr_task, wait_task, return_exceptions=True
+        )
         raise
 
     if aborted:
-        process.kill()
+        _kill_process_tree(process)
         await wait_task
         await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
         log.info("yt-dlp abortado para %s. Ultimas linhas:\n%s", url, _stderr_tail(10))
         raise ResolutionAborted(url)
 
     if timeout_reason is not None:
-        process.kill()
+        _kill_process_tree(process)
         await wait_task
         await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
         log.error(
@@ -692,10 +704,8 @@ class Music(commands.Cog):
     ) -> Track | None:
         """Resolve uma Track via yt-dlp. Retorna None em caso de falha.
 
-        Usa cookies quando disponiveis. Se o YouTube responder com bot check,
-        tenta de novo sem login (clientes sem cookie, ex. visionos) e marca os
-        cookies como ruins. Levanta :class:`BotCheckError` quando nem o fallback
-        sem cookie consegue extrair.
+        Usa cookies quando disponiveis. Num bot check, marca os cookies como
+        ruins (para o embed avisar a Staff) e levanta :class:`BotCheckError`.
         """
         if _is_track_fresh(track):
             return track
@@ -703,15 +713,20 @@ class Music(commands.Cog):
             log.info("Stream URL de '%s' expirou; resolvendo novamente", track.query)
             track.stream_url = None
 
-        use_cookies = _has_login_cookies() and not _cookies_rejected_for_current_file()
+        has_login_cookies = _has_login_cookies()
         started_at = time.monotonic()
         try:
-            data = await self._extract_with_cookie_fallback(
-                track, idle_timeout, max_timeout, abort_event, use_cookies
+            data = await _extract_info_isolated(
+                track.query,
+                idle_timeout,
+                max_timeout,
+                abort_event,
             )
         except ResolutionAborted:
             raise
         except BotCheckError:
+            if has_login_cookies:
+                _mark_cookies_rejected()
             raise
         except Exception as e:  # pylint: disable=broad-exception-caught
             log.error("Erro ao adquirir video da URL '%s': %s", track.query, e)
@@ -735,49 +750,6 @@ class Music(commands.Cog):
         if elapsed >= YTDLP_SLOW_STARTUP_SECONDS:
             log.warning("yt-dlp startup levou %.1fs para %s", elapsed, track.query)
         return track
-
-    async def _extract_with_cookie_fallback(
-        self,
-        track: Track,
-        idle_timeout: float,
-        max_timeout: float | None,
-        abort_event: asyncio.Event | None,
-        use_cookies: bool,
-    ) -> dict:
-        """Extrai a faixa; se o login for recusado, tenta anonimo (sem cookies).
-
-        Sem login o yt-dlp passa a usar clientes sem cookie (ex. visionos), o
-        que costuma escapar do bot check. Marcamos os cookies atuais como ruins
-        assim que o login e recusado, para as proximas resolucoes irem direto no
-        modo anonimo (mais rapido) e para o embed avisar a Staff, ate o arquivo
-        ser trocado (comando ``mgy cookies``).
-        """
-        try:
-            return await _extract_info_isolated(
-                track.query,
-                idle_timeout,
-                max_timeout,
-                abort_event,
-                use_cookies=use_cookies,
-            )
-        except BotCheckError:
-            if not use_cookies:
-                raise
-            log.warning(
-                "Cookies do YouTube recusados (bot check) para '%s'; tentando sem login",
-                track.query,
-            )
-            if _mark_cookies_rejected():
-                log.warning(
-                    "Extraindo sem cookies ate o cookies.txt ser atualizado (mgy cookies)"
-                )
-            return await _extract_info_isolated(
-                track.query,
-                idle_timeout,
-                max_timeout,
-                abort_event,
-                use_cookies=False,
-            )
 
     def _build_source(self, track: Track, state: GuildPlayer, extra_before: str = ""):
         """Cria o FFmpegPCMAudio para uma Track ja resolvida."""

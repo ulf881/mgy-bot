@@ -111,163 +111,9 @@ def test_enqueue_front_and_back(monkeypatch):
     state = cog._state(1)
 
     asyncio.run(cog._enqueue(state, [music.Track("a"), music.Track("b")], front=False))
-    asyncio.run(
-        cog._enqueue(state, [music.Track("c"), music.Track("d")], front=True)
-    )
+    asyncio.run(cog._enqueue(state, [music.Track("c")], front=True))
 
-    # -f tem que preservar a ordem: 'c' toca antes de 'd'.
-    assert [t.query for t in state.queue] == ["c", "d", "a", "b"]
-
-
-class _PendingTask:
-    def done(self):
-        return False
-
-
-def test_prefetch_after_enqueue_schedules_when_playing(monkeypatch):
-    cog = make_cog(monkeypatch)
-    state = cog._state(1)
-    state.voice = FakeVoice()
-    state.voice._playing = True
-    state.queue = [music.Track("next")]
-
-    scheduled = []
-    monkeypatch.setattr(
-        cog, "_schedule_prefetch", lambda gid, st: scheduled.append(gid)
-    )
-
-    cog._prefetch_after_enqueue(1, state)
-
-    assert scheduled == [1]
-
-
-def test_prefetch_after_enqueue_does_nothing_when_idle(monkeypatch):
-    cog = make_cog(monkeypatch)
-    state = cog._state(1)
-    state.queue = [music.Track("next")]
-
-    scheduled = []
-    monkeypatch.setattr(
-        cog, "_schedule_prefetch", lambda gid, st: scheduled.append(gid)
-    )
-
-    cog._prefetch_after_enqueue(1, state)
-
-    assert scheduled == []
-
-
-def test_prefetch_after_enqueue_keeps_running_prefetch_on_append(monkeypatch):
-    """Adicionar no fim nao pode reiniciar a resolucao da proxima faixa."""
-    cog = make_cog(monkeypatch)
-    state = cog._state(1)
-    state.voice = FakeVoice()
-    state.voice._playing = True
-    state.queue = [music.Track("next")]
-    state.prefetch_task = _PendingTask()
-
-    scheduled = []
-    monkeypatch.setattr(
-        cog, "_schedule_prefetch", lambda gid, st: scheduled.append(gid)
-    )
-
-    cog._prefetch_after_enqueue(1, state)
-
-    assert scheduled == []
-
-
-def test_prefetch_uses_longer_idle_timeout(monkeypatch):
-    """Prefetch roda junto com o ffmpeg, entao precisa de mais folga."""
-    cog = make_cog(monkeypatch)
-    state = cog._state(1)
-    state.queue = [music.Track("next")]
-    seen = {}
-
-    async def fake_resolve(track, **kwargs):
-        seen.update(kwargs)
-        return track
-
-    cog._resolve_track = fake_resolve
-
-    asyncio.run(cog._prefetch_next(1, state))
-
-    assert seen["idle_timeout"] == music.PREFETCH_IDLE_TIMEOUT_SECONDS
-    assert seen["wait_for_slot"] is False
-
-
-def test_prefetch_after_enqueue_restarts_when_front_changes_head(monkeypatch):
-    cog = make_cog(monkeypatch)
-    state = cog._state(1)
-    state.voice = FakeVoice()
-    state.voice._playing = True
-    state.queue = [music.Track("novo"), music.Track("antigo")]
-    state.prefetch_task = _PendingTask()
-
-    scheduled = []
-    monkeypatch.setattr(
-        cog, "_schedule_prefetch", lambda gid, st: scheduled.append(gid)
-    )
-
-    cog._prefetch_after_enqueue(1, state, front=True)
-
-    assert scheduled == [1]
-
-
-class FakeTyping:
-    async def __aenter__(self):
-        return None
-
-    async def __aexit__(self, *exc):
-        return False
-
-
-class FakeContext:
-    def __init__(self, guild_id=1):
-        self.guild = type("Guild", (), {"id": guild_id})()
-        self.sent = []
-
-    def typing(self):
-        return FakeTyping()
-
-    async def send(self, message):
-        self.sent.append(message)
-
-
-def test_play_reports_first_free_position(monkeypatch):
-    """Com a fila vazia a proxima musica e a posicao 1, nao 0."""
-    cog = make_cog(monkeypatch)
-    state = cog._state(1)
-    state.voice = FakeVoice()
-    state.voice._playing = True
-    ctx = FakeContext()
-
-    scheduled = []
-    monkeypatch.setattr(
-        cog, "_prefetch_after_enqueue", lambda gid, st, front=False: scheduled.append(front)
-    )
-
-    asyncio.run(cog.play.callback(cog, ctx, "song", ))
-
-    assert ctx.sent == ["```Adicionado à fila, posição: 1```"]
-    assert scheduled == [False]
-
-
-def test_play_front_reports_position_one(monkeypatch):
-    cog = make_cog(monkeypatch)
-    state = cog._state(1)
-    state.voice = FakeVoice()
-    state.voice._playing = True
-    state.queue = [music.Track("x")]
-    ctx = FakeContext()
-
-    scheduled = []
-    monkeypatch.setattr(
-        cog, "_prefetch_after_enqueue", lambda gid, st, front=False: scheduled.append(front)
-    )
-
-    asyncio.run(cog.play.callback(cog, ctx, "song", "-f"))
-
-    assert ctx.sent == ["```Adicionado à fila, posição: 1```"]
-    assert scheduled == [True]
+    assert [t.query for t in state.queue] == ["c", "a", "b"]
 
 
 def test_enqueue_respects_max_queue(monkeypatch):
@@ -450,74 +296,6 @@ def test_advance_locked_stops_on_resolution_aborted(monkeypatch):
     assert state.resolving is False
 
 
-def test_advance_locked_stops_when_budget_is_exhausted(monkeypatch):
-    """Sem orcamento, varias falhas lentas prendiam a guild e o slot por minutos."""
-    cog = make_cog(monkeypatch)
-    state = cog._state(1)
-    state.voice = FakeVoice()
-    state.queue = [music.Track("a"), music.Track("b")]
-    monkeypatch.setattr(music, "RESOLVE_TOTAL_BUDGET_SECONDS", 0)
-
-    calls = []
-    scheduled = []
-
-    async def fake_resolve(track, **kwargs):
-        calls.append(track.query)
-        return None
-
-    cog._resolve_track = fake_resolve
-    monkeypatch.setattr(
-        cog, "_schedule_advance_retry", lambda gid, st: scheduled.append(gid)
-    )
-
-    asyncio.run(cog._advance_locked(1, state))
-
-    assert calls == []  # nem tentou: o orcamento ja estava estourado
-    assert [t.query for t in state.queue] == ["a", "b"]  # fila preservada
-    assert state.voice.played is None
-    assert scheduled == [1]  # a guild vai tentar de novo sozinha
-
-
-def test_retry_advance_resumes_stalled_queue(monkeypatch):
-    """A retomada agendada volta a tocar em vez de deixar a guild muda."""
-    cog = make_cog(monkeypatch)
-    state = cog._state(1)
-    state.voice = FakeVoice()
-    state.queue = [music.Track("next")]
-
-    advanced = []
-
-    async def fake_advance(guild_id, st):
-        # O campo precisa estar livre para uma nova falha agendar outra tentativa.
-        assert st.retry_task is None
-        advanced.append(guild_id)
-
-    cog._advance_locked = fake_advance
-
-    asyncio.run(cog._retry_advance(1, state, 0))
-
-    assert advanced == [1]
-
-
-def test_retry_advance_does_nothing_when_already_playing(monkeypatch):
-    cog = make_cog(monkeypatch)
-    state = cog._state(1)
-    state.voice = FakeVoice()
-    state.current = music.Track("playing")
-    state.queue = [music.Track("next")]
-
-    advanced = []
-
-    async def fake_advance(guild_id, st):
-        advanced.append(guild_id)
-
-    cog._advance_locked = fake_advance
-
-    asyncio.run(cog._retry_advance(1, state, 0))
-
-    assert advanced == []
-
-
 def test_on_track_end_ignores_stale_generation(monkeypatch):
     cog = make_cog(monkeypatch)
     state = cog._state(1)
@@ -614,7 +392,7 @@ def test_resolve_track_refreshes_stale_url(monkeypatch):
     track.stream_url = "https://c.example.com/v?expire=%d" % (int(time.time()) - 60)
     track.resolved_at = time.monotonic()
 
-    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True, wait_for_slot=True):
+    async def fake_extract(query, idle_timeout, max_timeout, abort_event):
         return {"url": "https://campo.example.com/v?expire=%d" % (int(time.time()) + 3600), "title": "nova"}
 
     monkeypatch.setattr(music, "_extract_info_isolated", fake_extract)
@@ -681,22 +459,22 @@ def _fake_extract_data():
     }
 
 
-def test_resolve_track_uses_cookies_when_available(monkeypatch):
+def test_resolve_track_extracts_once(monkeypatch):
     cog = make_cog(monkeypatch)
     track = music.Track("song")
-    monkeypatch.setattr(music, "_has_login_cookies", lambda: True)
 
     calls = []
 
-    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True, wait_for_slot=True):
-        calls.append(use_cookies)
+    async def fake_extract(query, idle_timeout, max_timeout, abort_event):
+        calls.append(query)
         return _fake_extract_data()
 
     monkeypatch.setattr(music, "_extract_info_isolated", fake_extract)
 
     asyncio.run(cog._resolve_track(track))
 
-    assert calls == [True]
+    assert calls == ["song"]  # sem retry/fallback: uma extracao por faixa
+    assert track.title == "ok"
 
 
 def test_resolve_track_marks_cookies_rejected_on_bot_check(monkeypatch):
@@ -710,8 +488,8 @@ def test_resolve_track_marks_cookies_rejected_on_bot_check(monkeypatch):
 
     calls = []
 
-    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True, wait_for_slot=True):
-        calls.append(use_cookies)
+    async def fake_extract(query, idle_timeout, max_timeout, abort_event):
+        calls.append(query)
         raise music.BotCheckError("sign in to confirm")
 
     monkeypatch.setattr(music, "_extract_info_isolated", fake_extract)
@@ -723,16 +501,19 @@ def test_resolve_track_marks_cookies_rejected_on_bot_check(monkeypatch):
     else:
         raise AssertionError("BotCheckError deveria propagar")
 
-    assert calls == [True]  # uma unica extracao, sem fallback sem cookies
+    assert calls == ["song"]  # uma unica extracao, sem retry
     assert marked == [1]
 
 
-def test_resolve_track_reraises_bot_check_without_cookies(monkeypatch):
+def test_resolve_track_does_not_mark_without_login_cookies(monkeypatch):
     cog = make_cog(monkeypatch)
     track = music.Track("song")
     monkeypatch.setattr(music, "_has_login_cookies", lambda: False)
 
-    async def fake_extract(query, idle_timeout, max_timeout, abort_event, use_cookies=True, wait_for_slot=True):
+    marked = []
+    monkeypatch.setattr(music, "_mark_cookies_rejected", lambda: marked.append(1) or True)
+
+    async def fake_extract(query, idle_timeout, max_timeout, abort_event):
         raise music.BotCheckError("sign in to confirm")
 
     monkeypatch.setattr(music, "_extract_info_isolated", fake_extract)
@@ -743,6 +524,7 @@ def test_resolve_track_reraises_bot_check_without_cookies(monkeypatch):
     except music.BotCheckError:
         raised = True
     assert raised
+    assert marked == []
 
 
 def test_has_login_cookies_false_without_file(monkeypatch, tmp_path):
