@@ -296,6 +296,114 @@ def test_advance_locked_stops_on_resolution_aborted(monkeypatch):
     assert state.resolving is False
 
 
+def test_advance_reuses_inflight_prefetch(monkeypatch):
+    """O avanco nao pode matar o prefetch da faixa que vai tocar agora."""
+    cog = make_cog(monkeypatch)
+    state = cog._state(1)
+    state.voice = FakeVoice()
+    track = music.Track("next")
+    state.queue = [track]
+    calls = []
+
+    async def fake_resolve(t, **kwargs):
+        if music._is_track_fresh(t):
+            return t
+        calls.append(t.query)
+        await asyncio.sleep(0)
+        return _fake_resolved(t, **kwargs)
+
+    cog._resolve_track = fake_resolve
+    cog._build_source = lambda track, state, extra_before="": FakeSource()
+
+    async def scenario():
+        state.prefetch_track = track
+        state.prefetch_task = asyncio.create_task(
+            cog._prefetch_next(1, state, track)
+        )
+        await cog._advance_locked(1, state)
+
+    asyncio.run(scenario())
+
+    assert calls == ["next"]  # resolveu uma vez so
+    assert state.current is track
+    assert state.prefetch_task is None and state.prefetch_track is None
+
+
+def test_schedule_prefetch_keeps_inflight_for_same_head(monkeypatch):
+    """Reagendar a mesma cabeca nao reinicia a extracao em andamento."""
+    cog = make_cog(monkeypatch)
+    state = cog._state(1)
+    track = music.Track("next")
+    state.queue = [track]
+
+    async def scenario():
+        state.prefetch_track = track
+        task = asyncio.create_task(asyncio.sleep(10))
+        state.prefetch_task = task
+
+        cog._schedule_prefetch(1, state)
+
+        assert state.prefetch_task is task
+        assert not task.done()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_schedule_prefetch_replaces_stale_head(monkeypatch):
+    """Com -f a cabeca muda: o preload velho sai e o novo entra na hora."""
+    cog = make_cog(monkeypatch)
+    state = cog._state(1)
+    old = music.Track("old")
+    new = music.Track("new")
+    state.queue = [new, old]
+    started = []
+
+    async def fake_prefetch(guild_id, st, track):
+        started.append(track.query)
+        await asyncio.sleep(10)
+
+    cog._prefetch_next = fake_prefetch
+
+    async def scenario():
+        old_task = asyncio.create_task(asyncio.sleep(10))
+        state.prefetch_track = old
+        state.prefetch_task = old_task
+
+        cog._schedule_prefetch(1, state)
+
+        assert state.prefetch_track is new
+        assert state.prefetch_task is not old_task
+        await asyncio.gather(old_task, return_exceptions=True)
+        assert old_task.cancelled()
+        assert started == ["new"]
+
+        state.prefetch_task.cancel()
+        await asyncio.gather(state.prefetch_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_abort_resolution_keeps_prefetch(monkeypatch):
+    """Skip/stop abortam o playback, nao o preload da proxima faixa."""
+    cog = make_cog(monkeypatch)
+    state = cog._state(1)
+    state.resolving = True
+    state.prefetch_track = music.Track("next")
+
+    async def scenario():
+        task = asyncio.create_task(asyncio.sleep(10))
+        state.prefetch_task = task
+        cog._abort_resolution(state)
+        assert state.abort_event.is_set()
+        assert not task.done()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
 def test_on_track_end_ignores_stale_generation(monkeypatch):
     cog = make_cog(monkeypatch)
     state = cog._state(1)

@@ -16,6 +16,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import sys
 import time
 from dataclasses import dataclass, field
@@ -45,14 +46,30 @@ FFMPEG_SLOW_STARTUP_SECONDS = 5
 # 90s: resolve lentas mas vivas (ex.: JS challenge ocasional) terminam em vez
 # de serem mortas no prefetch; skip/stop continuam abortando na hora.
 YTDLP_IDLE_TIMEOUT_SECONDS = 90
+# Durante um desafio JS o yt-dlp fica em silencio no stderr (o quickjs nao
+# imprime nada enquanto roda). Na maquina alvo o desafio leva ~60-140s, entao
+# o timeout normal o mataria no meio e a extracao recomecaria do zero. Enquanto
+# um desafio esta ativo vale esta janela maior; o teto absoluto continua.
+try:
+    YTDLP_JS_CHALLENGE_IDLE_TIMEOUT_SECONDS = int(
+        os.environ.get("YTDLP_JS_IDLE_TIMEOUT_SECONDS", "240")
+    )
+except ValueError:
+    YTDLP_JS_CHALLENGE_IDLE_TIMEOUT_SECONDS = 240
+YTDLP_JS_CHALLENGE_MARKERS = ("[jsc:", "Solving JS challenges")
 # Teto absoluto de seguranca, mesmo que o yt-dlp continue imprimindo saida.
 YTDLP_MAX_TIMEOUT_SECONDS = 900
 # Intervalo de checagem do yt-dlp: curto para reagir rapido a skip/stop
 # (abort) e para medir a inatividade com precisao.
 YTDLP_POLL_INTERVAL_SECONDS = 1.0
-# Prioridade (nice) do yt-dlp e do deno que ele spawna: quanto maior, menor a
-# prioridade de CPU, para nao competir com o ffmpeg durante a resolucao.
-YTDLP_NICE_LEVEL = 15
+# Prioridade (nice) do yt-dlp e do runtime JS que ele spawna: quanto maior,
+# menor a prioridade de CPU, para nao competir com o ffmpeg durante a
+# resolucao. Maquina alvo (1 core, 512MB): 10 mantem o audio com prioridade
+# sem sufocar a extracao. 0 desativa o wrapper.
+try:
+    YTDLP_NICE_LEVEL = int(os.environ.get("YTDLP_NICE_LEVEL", "10"))
+except ValueError:
+    YTDLP_NICE_LEVEL = 10
 # Reconexao de voz: quantas tentativas e quanto esperar entre elas.
 VOICE_CONNECT_ATTEMPTS = 3
 VOICE_RECONNECT_DELAY_SECONDS = 2.0
@@ -203,6 +220,9 @@ class GuildPlayer:
     started_at: float = 0.0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     prefetch_task: asyncio.Task | None = None
+    # Faixa que o prefetch em andamento esta resolvendo (o objeto da fila).
+    # Permite reaproveitar a extracao em vez de cancelar e recomecar.
+    prefetch_track: Track | None = None
     # Sinaliza para uma resolucao yt-dlp em andamento que ela deve parar
     # (setado por skip/stop; limpo quando um novo avanco comeca).
     abort_event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -487,22 +507,31 @@ async def _extract_info_isolated(
             command.extend(["--js-runtimes", runtime])
     command.append(url)
 
-    # O yt-dlp (e o deno que ele spawna para resolver JS challenges do
-    # YouTube) roda em prioridade menor que o ffmpeg, para nao roubar CPU
-    # do audio durante a resolucao do prefetch.
-    if sys.platform != "win32" and shutil.which("nice"):
+    # O yt-dlp (e o runtime JS que ele spawna para resolver os desafios do
+    # YouTube) roda em prioridade menor que o ffmpeg, para nao roubar CPU do
+    # audio durante a resolucao do prefetch. Em Windows nao existe "nice", e
+    # o which() ja cuida disso (sem checar sys.platform, que o Pyright estreita
+    # para "win32" e marca este bloco como inalcancavel).
+    if YTDLP_NICE_LEVEL > 0 and shutil.which("nice"):
         command = ["nice", "-n", str(YTDLP_NICE_LEVEL), *command]
 
     process = await asyncio.create_subprocess_exec(
         *command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        # Sessao propria para o killpg alcancar o runtime JS que o yt-dlp
+        # spawna (quickjs). Sem isso killpg(pid) nao acha o grupo e os filhos
+        # sobrevivem ao abort.
+        start_new_session=True,
         limit=1024 * 1024,
     )
 
     stdout_chunks: list[bytes] = []
     stderr_lines: list[str] = []
     last_activity = time.monotonic()
+    # Instante ate o qual um desafio JS em andamento ainda tem credito de
+    # tempo, mesmo sem nenhuma linha nova no stderr.
+    challenge_deadline: float | None = None
 
     async def _drain_stdout(stream):
         # Le em blocos: o JSON de --dump-single-json e uma unica linha enorme,
@@ -518,7 +547,7 @@ async def _extract_info_isolated(
             last_activity = time.monotonic()
 
     async def _drain_stderr(stream):
-        nonlocal last_activity
+        nonlocal last_activity, challenge_deadline
         if stream is None:
             return
         while True:
@@ -530,6 +559,13 @@ async def _extract_info_isolated(
             if not line:
                 continue
             stderr_lines.append(line)
+            if any(marker in line for marker in YTDLP_JS_CHALLENGE_MARKERS):
+                challenge_deadline = (
+                    time.monotonic() + YTDLP_JS_CHALLENGE_IDLE_TIMEOUT_SECONDS
+                )
+            elif challenge_deadline is not None and not line.startswith("[debug]"):
+                # O desafio terminou: volta ao timeout de inatividade normal.
+                challenge_deadline = None
             # Filtra as linhas [debug] do --verbose a menos que YTDLP_DEBUG
             if line.startswith("[debug]") and not YTDLP_DEBUG:
                 log.debug("yt-dlp [%s] %s", url, line)
@@ -554,6 +590,8 @@ async def _extract_info_isolated(
 
             now = time.monotonic()
             idle_left = idle_timeout - (now - last_activity)
+            if challenge_deadline is not None:
+                idle_left = max(idle_left, challenge_deadline - now)
             if idle_left <= 0:
                 timeout_reason = f"sem saida por {idle_timeout:.0f}s"
                 break
@@ -934,6 +972,7 @@ class Music(commands.Cog):
         """Cancela a resolucao antecipada em andamento, se houver."""
         task = state.prefetch_task
         state.prefetch_task = None
+        state.prefetch_track = None
         if task is not None and not task.done():
             task.cancel()
 
@@ -942,35 +981,89 @@ class Music(commands.Cog):
 
         Retorna True se havia uma resolucao em andamento (para o chamador
         decidir o que fazer com a faixa que foi descartada).
+
+        O prefetch da proxima faixa nao e cancelado aqui: num skip ele e
+        exatamente a faixa que vai tocar, e jogar a extracao fora faria o
+        yt-dlp refazer o desafio JS do zero (~2 min na maquina alvo).
         """
         was_resolving = state.resolving
         state.abort_event.set()
-        self._cancel_prefetch(state)
         return was_resolving
 
     def _schedule_prefetch(self, guild_id: int, state: GuildPlayer):
-        """Resolve a proxima faixa em segundo plano para esconder a latencia."""
-        self._cancel_prefetch(state)
-        if not state.queue or _is_track_fresh(state.queue[0]):
-            return
-        state.prefetch_task = asyncio.create_task(self._prefetch_next(guild_id, state))
+        """Resolve a proxima faixa em segundo plano para esconder a latencia.
 
-    async def _prefetch_next(self, guild_id: int, state: GuildPlayer):
-        """Resolve a proxima faixa da fila (mutando o proprio objeto da fila)."""
+        Se o prefetch em andamento ja e da faixa na cabeca da fila ele e
+        mantido; cancelar e recomecar so repetiria a extracao (e o desafio JS).
+        """
         if not state.queue:
+            self._cancel_prefetch(state)
             return
-        track = state.queue[0]
-        if _is_track_fresh(track):
+        head = state.queue[0]
+        if _is_track_fresh(head):
+            if state.prefetch_track is head:
+                self._cancel_prefetch(state)
             return
+        if (
+            state.prefetch_track is head
+            and state.prefetch_task is not None
+            and not state.prefetch_task.done()
+        ):
+            return
+        self._cancel_prefetch(state)
+        state.prefetch_track = head
+        state.prefetch_task = asyncio.create_task(
+            self._prefetch_next(guild_id, state, head)
+        )
+
+    async def _prefetch_next(self, guild_id: int, state: GuildPlayer, track: Track):
+        """Resolve a proxima faixa da fila (mutando o proprio objeto da fila)."""
         try:
             resolved = await self._resolve_track(track)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # pylint: disable=broad-exception-caught
             log.debug("Prefetch falhou para %s: %s", track.query, e)
-            return
-        if resolved is not None:
-            log.info("Prefetch pronto: %s", resolved.display_name())
+        else:
+            if resolved is not None:
+                log.info("Prefetch pronto: %s", resolved.display_name())
+        finally:
+            # Nao limpa o estado se outro prefetch ja assumiu o lugar.
+            if state.prefetch_track is track:
+                state.prefetch_track = None
+                if state.prefetch_task is asyncio.current_task():
+                    state.prefetch_task = None
+
+    async def _await_prefetch(self, state: GuildPlayer, track: Track) -> bool:
+        """Aproveita o prefetch da faixa que vai tocar agora.
+
+        Retorna False quando skip/stop pediu para parar durante a espera (a
+        faixa e descartada, como numa resolucao abortada).
+        """
+        task = state.prefetch_task
+        if task is None or state.prefetch_track is not track:
+            self._cancel_prefetch(state)
+            return True
+        state.prefetch_task = None
+        state.prefetch_track = None
+        if task.done():
+            return True
+
+        log.info("Aguardando prefetch de %s", track.display_name())
+        abort_waiter = asyncio.create_task(state.abort_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {task, abort_waiter}, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            abort_waiter.cancel()
+            await asyncio.gather(abort_waiter, return_exceptions=True)
+
+        if task in done:
+            return True
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return False
 
     async def _resolve_for_playback(
         self, state: GuildPlayer, track: Track
@@ -1003,7 +1096,6 @@ class Music(commands.Cog):
 
     async def _advance_locked(self, guild_id: int, state: GuildPlayer):
         """Toca a proxima faixa valida. Deve ser chamado com o lock adquirido."""
-        self._cancel_prefetch(state)
         state.abort_event.clear()
         if state.current is not None or state.voice is None:
             return
@@ -1012,6 +1104,11 @@ class Music(commands.Cog):
         while state.queue and attempts < MAX_RESOLVE_ATTEMPTS:
             attempts += 1
             track = state.queue.pop(0)
+            # Se o prefetch ja esta resolvendo esta faixa, espera ele terminar
+            # em vez de matar o yt-dlp e comecar tudo de novo.
+            if not await self._await_prefetch(state, track):
+                log.info("Resolucao de '%s' abortada (skip/stop)", track.query)
+                return
             state.resolving = True
             try:
                 resolved = await self._resolve_for_playback(state, track)
@@ -1439,6 +1536,8 @@ class Music(commands.Cog):
             if state.voice and (state.voice.is_playing() or state.voice.is_paused()):
                 log.info("Esta tocando, adicionando a queue")
                 position = 1 if "-f" in args else len(state.queue) - 1
+                # Preload da proxima faixa (agora a cabeca da fila).
+                self._schedule_prefetch(ctx.guild.id, state)
                 await ctx.send(f"```Adicionado à fila, posição: {position}```")
             else:
                 log.info("Nao esta tocando, comecando agora")
@@ -1607,6 +1706,7 @@ class Music(commands.Cog):
 
             await self._enqueue(state, tracks, front=False)
             if state.voice and (state.voice.is_playing() or state.voice.is_paused()):
+                self._schedule_prefetch(ctx.guild.id, state)
                 await ctx.send(
                     f"```Adicionado {num} à lista. Total na lista: {len(state.queue)}```"
                 )
@@ -1644,6 +1744,7 @@ class Music(commands.Cog):
             await self.randomizequeue(ctx)
 
             if state.voice and (state.voice.is_playing() or state.voice.is_paused()):
+                self._schedule_prefetch(ctx.guild.id, state)
                 await ctx.send(
                     f"```Adicionado {quan} Bonus Room à lista. Total na lista: {len(state.queue)}```"
                 )
@@ -1684,6 +1785,7 @@ class Music(commands.Cog):
                 await self.randomizequeue(ctx)
 
             if state.voice and (state.voice.is_playing() or state.voice.is_paused()):
+                self._schedule_prefetch(ctx.guild.id, state)
                 await ctx.send(
                     f"```Adicionado {resultado[0]['name']} à lista. Total na lista: {len(state.queue)}```"
                 )
